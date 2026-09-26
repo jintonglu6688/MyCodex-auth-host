@@ -50,6 +50,7 @@ pub(super) fn handle(state: &AppState, method: &str, params: &Value) -> Result<V
         "account/remove" => {
             let id = params["accountId"].as_str().ok_or("invalid_params")?;
             let _guard = lifecycle::mutation()?;
+            super::auto_capture::before_write(state)?;
             block_on(crate::remove_codex_oauth_account_with_switch_lock(
                 state, id,
             ))

@@ -1,5 +1,19 @@
 # MyCodex 原版服务接入验证
 
+## 全局认证自动收录（#117—#120）
+
+2026-09-26：用户确认 Windows 隔离目标空库自动收录正常并接受本轮交付，授权提交、推送及关闭 #117—#120。下述自动检查与尚未逐项实测的人工范围分别保留，后续问题另行跟进；#116 一键部署不变。
+
+本节替代下文历史阶段“自动收录尚未开发”和“外部 live 冲突导致启动失败”的描述。新能力 `globalAuthCapture` 由 `mycodex_host/auto_capture` 集中处理，启动在路由恢复前识别全局认证，供应商读取/写入复用同一入口；诊断 status 仍纯读。`gui/provider/list` 返回同次核对后的 liveState、syncError、current 和 route，未知配置保留存档列表但不宣称旧项仍为当前。
+
+- 文件型 ChatGPT 通过原 `CodexOAuthManager::import_existing_login` 保存，sub/workspace 匹配后固定 UUID，支持隐式 auth_mode。API 按有效地址、协议和凭据来源匹配，首版统一自定义类型，保留环境变量引用。
+- 原 DAO 仅归档，绕过首项 add 的自动应用；全局 auth/config 字节保持不变。首次 MCP、公用片段使用原服务，后续不隐式同步 MCP。
+- 实际原版回填及当前行写入前验证读取的同一 live 值；这两处 guard 仅对 MyCodex runtime 的 Codex 生效。配置比较复用原版 bearer 投影及生成 catalog 指针识别，忽略显示名称，不把标准投影差异误认作另一套配置。
+- 自身路由仍须通过目标 URL 和私有头核验。外部改为直连后停止新请求准入，等原流结束再清除旧接管状态；不回写旧 backup。原服务失败不再次 reconcile 旧转换行。异常全局可启动管理后台，维护 shutdown 只停非自有监听，不覆盖未知文件。
+- 收录不请求网络、不刷新 token，保留来源代际。正常导入不降代；上游服务端拒绝 refresh 后尝试不同 live token 的恢复策略保持不变，不能扩展解释为所有在线路径永不采用旧 token。
+
+验证使用临时目标和合成凭据：Windows 6 项导入、1 项隐式 marker、35 项原版 OAuth 单测通过；Windows/WSL/Mac 的 GUI 与核心进程回归覆盖外部切换、流式请求、公用片段和 MCP。客户端另有真实 C#→后台包集成检查。实际读屏、真实外部账号切换与在线刷新仍待人工验收。此次远端测试使用独立构建目录和临时 HOME，没有替换正式部署或改真实 `.codex`。详细结果及启动方式见 MyCodex 的 `docs/authentication-center-testing.md`。
+
 2026-09-26：已完成 Windows 原版服务、常驻账号管理、转换路由和 GUI RPC 适配的隔离验证。GUI 必须明确选择协议 2，不能将本产物直接替换旧协议后台；尚非发行版。
 
 ## 固定基线与位置

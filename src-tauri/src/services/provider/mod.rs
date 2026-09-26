@@ -5383,6 +5383,22 @@ impl ProviderService {
             crate::settings::get_effective_current_provider(&state.db, &app_type)?;
         let is_current = effective_current.as_deref() == Some(provider.id.as_str());
 
+        if is_current
+            && matches!(app_type, AppType::Codex)
+            && crate::mycodex_host::runtime_paths().is_some()
+        {
+            // The host's earlier reconciliation cannot authorize a later read
+            // after an external CLI switches identities. Check the stored owner
+            // before either its row or its live configuration can be replaced.
+            let existing = existing_provider
+                .as_ref()
+                .ok_or_else(|| AppError::Message("config_conflict".into()))?;
+            let live = read_live_settings(AppType::Codex)
+                .map_err(|_| AppError::Message("config_conflict".into()))?;
+            crate::mycodex_host::auto_capture::require_live_owner(state, existing, &live)
+                .map_err(|_| AppError::Message("config_conflict".into()))?;
+        }
+
         let existing_managed_codex_account_id = existing_provider
             .as_ref()
             .and_then(Self::managed_codex_oauth_account_id);
@@ -5842,13 +5858,41 @@ impl ProviderService {
             .and_then(Self::managed_codex_oauth_account_id);
         let mut backfill_completed = false;
         if let Some(current_id) = current_id {
+            if current_id == id
+                && matches!(app_type, AppType::Codex)
+                && crate::mycodex_host::runtime_paths().is_some()
+            {
+                let live = read_live_settings(AppType::Codex)
+                    .map_err(|_| AppError::Message("config_conflict".into()))?;
+                crate::mycodex_host::auto_capture::require_live_owner(state, provider, &live)
+                    .map_err(|_| AppError::Message("config_conflict".into()))?;
+            }
             if current_id != id {
                 // Additive mode apps - all providers coexist in the same file,
                 // no backfill needed (backfill is for exclusive mode apps like Claude/Codex/Gemini)
                 if !app_type.is_additive_mode() {
                     // Only backfill when switching to a different provider
-                    if let Ok(live_config) = read_live_settings(app_type.clone()) {
+                    let live = read_live_settings(app_type.clone());
+                    if live.is_err()
+                        && matches!(app_type, AppType::Codex)
+                        && crate::mycodex_host::runtime_paths().is_some()
+                    {
+                        return Err(AppError::Message("config_conflict".into()));
+                    }
+                    if let Ok(live_config) = live {
                         if let Some(mut current_provider) = providers.get(&current_id).cloned() {
+                            if matches!(app_type, AppType::Codex)
+                                && crate::mycodex_host::runtime_paths().is_some()
+                            {
+                                // Validate the same value that will be backfilled,
+                                // before common extraction or provider persistence.
+                                crate::mycodex_host::auto_capture::require_live_owner(
+                                    state,
+                                    &current_provider,
+                                    &live_config,
+                                )
+                                .map_err(|_| AppError::Message("config_conflict".into()))?;
+                            }
                             // 切走前先把 live 里的可共享改动（含用户直接在应用内
                             // 装插件/加 hook/改偏好）同步进通用配置片段，再做剥离回填。
                             // 详见 sync_common_config_snippet_from_live 的文档。

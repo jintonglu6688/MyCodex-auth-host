@@ -115,11 +115,24 @@ fn api(id: &str, model: &str, shared: bool) -> Value {
         "config":format!("model = \"{model}\"\nmodel_provider = \"{id}\"\n[model_providers.{id}]\nname = \"{id}\"\nbase_url = \"https://{id}.example.invalid/v1\"\nwire_api = \"responses\"\n")}})
 }
 
+fn account_token(id: &str, generation: u32) -> String {
+    use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+    let claims = json!({"sub":id,"email":format!("{id}@example.invalid"),"exp":4102444800u64,
+        "generation":generation,"https://api.openai.com/auth":{"chatgpt_account_id":id}});
+    format!(
+        "{}.{}.signature",
+        URL_SAFE_NO_PAD.encode(br#"{"alg":"none"}"#),
+        URL_SAFE_NO_PAD.encode(serde_json::to_vec(&claims).unwrap())
+    )
+}
+
 fn account(id: &str) -> Value {
     json!({"id":id,"name":id,"category":"official",
         "meta":{"commonConfigEnabled":true},
         "settingsConfig":{"auth":{"auth_mode":"chatgpt","OPENAI_API_KEY":null,
-            "tokens":{"access_token":format!("synthetic-secret-{id}"),"account_id":id}},
+            "tokens":{"access_token":account_token(id, 1),"id_token":account_token(id, 1),
+                "refresh_token":format!("synthetic-secret-refresh-{id}"),"account_id":id},
+            "last_refresh":"2024-01-01T00:00:00Z"},
         "config":"model = \"test-model\"\n"}})
 }
 
@@ -376,6 +389,15 @@ fn resident_routes_chat_and_anthropic_then_restores_direct_accounts() {
 
 #[test]
 fn streaming_requests_block_mutation_and_old_connections_cannot_route_direct_accounts() {
+    streaming_switch(false);
+}
+
+#[test]
+fn external_switch_during_stream_drains_original_request_and_blocks_new_requests() {
+    streaming_switch(true);
+}
+
+fn streaming_switch(external: bool) {
     let runtime = tokio::runtime::Runtime::new().unwrap();
     let (arrived_tx, arrived_rx) = std::sync::mpsc::channel();
     let release = std::sync::Arc::new(tokio::sync::Notify::new());
@@ -441,13 +463,44 @@ fn streaming_requests_block_mutation_and_old_connections_cannot_route_direct_acc
         );
         assert_eq!(p.live_text(), before);
     }
+    let external_config = "model='external'\nmodel_provider='external'\n[model_providers.external]\nname='External'\nbase_url='https://external.example.invalid/v1'\nrequires_openai_auth=true\n";
+    let external_auth = r#"{"OPENAI_API_KEY":"synthetic-secret-external"}"#;
+    if external {
+        fs::write(p.codex.join("config.toml"), external_config).unwrap();
+        fs::write(p.codex.join("auth.json"), external_auth).unwrap();
+        let state = p.ok("gui/provider/list", json!({}));
+        assert_eq!(state["liveState"], "unavailable");
+        assert_eq!(state["syncError"], "route_requests_active");
+        assert_eq!(state["route"]["accepting"], false);
+        let blocked = runtime
+            .block_on(
+                client
+                    .post(&url)
+                    .header("x-mycodex-route-token", &route_token)
+                    .json(&json!({"input":"must not forward"}))
+                    .send(),
+            )
+            .unwrap();
+        assert_eq!(blocked.status(), reqwest::StatusCode::SERVICE_UNAVAILABLE);
+    }
     release.notify_one();
     let response = runtime.block_on(request).unwrap();
     assert!(
         response.contains("response.completed"),
         "stream did not finish: {response}"
     );
-    p.switch("official");
+    if external {
+        let state = p.ok("gui/provider/list", json!({}));
+        assert_eq!(state["liveState"], "current");
+        assert_eq!(state["providers"].as_array().unwrap().len(), 3);
+        assert_eq!(p.live_text(), external_config);
+        assert_eq!(
+            fs::read_to_string(p.codex.join("auth.json")).unwrap(),
+            external_auth
+        );
+    } else {
+        p.switch("official");
+    }
     // Reuse the HTTP pool: upstream stop alone leaves detached keep-alive tasks.
     let old = runtime.block_on(async {
         client
@@ -505,18 +558,16 @@ fn resident_rejects_official_conversion_duplicate_add_and_external_live_overwrit
     let external = "model = \"externally-selected\"\n";
     fs::write(p.codex.join("config.toml"), external).unwrap();
     fs::write(p.codex.join("auth.json"), "{}").unwrap();
-    for (method, params) in [
-        ("provider/switch", json!({"providerId":"official"})),
-        ("provider/switch", json!({"providerId":"chat"})),
-        ("backend/shutdown", json!({})),
-    ] {
-        assert_eq!(
-            p.call(method, params)["error"]["message"],
-            "route_live_changed_externally"
-        );
-        assert_eq!(p.live_text(), external);
-    }
+    assert_eq!(
+        p.call("provider/switch", json!({"providerId":"official"}))["error"]["message"],
+        "config_conflict"
+    );
+    assert_eq!(p.live_text(), external);
+    assert_eq!(p.ok("provider/list", json!({}))["currentProviderId"], "");
     assert_eq!(p.ok("status", json!({}))["route"]["accepting"], false);
+    p.ok("backend/shutdown", json!({}));
+    assert_eq!(p.live_text(), external);
+    assert_eq!(fs::read_to_string(p.codex.join("auth.json")).unwrap(), "{}");
 }
 
 #[test]
@@ -565,6 +616,9 @@ fn failed_route_bind_can_switch_back_to_direct_without_stale_proxy_flags() {
         "route_start_failed"
     );
     assert_eq!(p.ok("status", json!({}))["route"]["accepting"], false);
+    // Refresh observes the original service's partial activation outcome
+    // before a new explicit switch (as the GUI preflight does).
+    p.ok("gui/provider/list", json!({}));
     p.switch("official");
     let connection = rusqlite::Connection::open(p.data.join("cc-switch.db")).unwrap();
     let flags: i64 = connection
@@ -727,19 +781,23 @@ fn common_preferences_tools_and_mcp_keep_upstream_semantics() {
 
 #[test]
 fn native_chatgpt_auth_switches_direct_and_retains_rotated_live_token() {
-    let p = Probe::new();
+    let mut p = Probe::new();
+    let _daemon = Resident::start(&mut p);
     p.add(account("account-a"));
     p.add(account("account-b"));
     let auth_path = p.codex.join("auth.json");
     let mut auth: Value = serde_json::from_slice(&fs::read(&auth_path).unwrap()).unwrap();
-    auth["tokens"]["access_token"] = json!("synthetic-secret-rotated");
+    let rotated = account_token("account-a", 2);
+    auth["tokens"]["access_token"] = json!(rotated);
+    auth["tokens"]["refresh_token"] = json!("synthetic-secret-rotated");
+    auth["last_refresh"] = json!("2025-01-01T00:00:00Z");
     fs::write(&auth_path, serde_json::to_vec(&auth).unwrap()).unwrap();
     p.switch("account-b");
     let b: Value = serde_json::from_slice(&fs::read(&auth_path).unwrap()).unwrap();
     assert_eq!(b["tokens"]["account_id"], "account-b");
     p.switch("account-a");
     let a: Value = serde_json::from_slice(&fs::read(&auth_path).unwrap()).unwrap();
-    assert_eq!(a["tokens"]["access_token"], "synthetic-secret-rotated");
+    assert_eq!(a["tokens"]["access_token"], rotated);
     let live = p.live_text();
     for marker in ["127.0.0.1", "localhost", "PROXY_MANAGED"] {
         assert!(!live.contains(marker));
@@ -995,7 +1053,7 @@ fn route_credentials_are_target_private_persistent_and_never_backfilled() {
 }
 
 #[test]
-fn altered_route_credentials_fail_closed_and_fallback_cleanup_removes_them() {
+fn altered_route_credentials_and_orphaned_route_are_preserved_for_repair() {
     let mut p = Probe::new();
     let daemon = Resident::start(&mut p);
     p.add(routed("chat", "openai_chat", "https://example.invalid/v1"));
@@ -1004,14 +1062,16 @@ fn altered_route_credentials_fail_closed_and_fallback_cleanup_removes_them() {
     let changed = original.replace(&token, "external-change");
     fs::write(p.codex.join("config.toml"), &changed).unwrap();
     assert_eq!(
-        p.call("backend/shutdown", json!({}))["error"]["message"],
-        "route_live_changed_externally"
+        p.ok("gui/provider/list", json!({}))["liveState"],
+        "unavailable"
     );
     assert!(p.live_text() == changed);
     assert_eq!(p.ok("status", json!({}))["route"]["accepting"], false);
+    p.ok("backend/shutdown", json!({}));
+    assert!(p.live_text() == changed);
     fs::write(p.codex.join("config.toml"), original).unwrap();
     drop(daemon);
-    // Exercise the original cleanup-only fallback: no provider or backup remains.
+    // Without a provider or backup, keep the global files intact for repair.
     let connection = rusqlite::Connection::open(p.data.join("cc-switch.db")).unwrap();
     connection
         .execute("DELETE FROM proxy_live_backup WHERE app_type='codex'", [])
@@ -1021,8 +1081,12 @@ fn altered_route_credentials_fail_closed_and_fallback_cleanup_removes_them() {
         .unwrap();
     drop(connection);
     let _restarted = Resident::start(&mut p);
-    assert!(!p.live_text().contains("x-mycodex-route-token") && !p.live_text().contains(&token));
-    assert_eq!(p.ok("status", json!({}))["route"]["takeover"], false);
+    assert!(p.live_text().contains("x-mycodex-route-token") && p.live_text().contains(&token));
+    assert_eq!(
+        p.ok("gui/provider/list", json!({}))["liveState"],
+        "unavailable"
+    );
+    assert_eq!(p.ok("status", json!({}))["route"]["running"], false);
     p.ok("backend/shutdown", json!({}));
 }
 

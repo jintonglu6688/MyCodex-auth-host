@@ -2525,15 +2525,10 @@ impl ProxyService {
             }
             AppType::Codex => {
                 let config = self.read_codex_live()?;
-                let base_url_matches = config
-                    .get("config")
-                    .and_then(|value| value.as_str())
-                    .is_some_and(|config_text| {
-                        Self::codex_config_has_base_url_matching(config_text, |url| {
-                            Self::proxy_urls_match(url, &proxy_codex_base_url)
-                        })
-                    });
-                Ok(Self::is_codex_live_taken_over(&config) && base_url_matches)
+                Ok(Self::codex_live_matches_proxy(
+                    &config,
+                    &proxy_codex_base_url,
+                ))
             }
             AppType::Gemini => {
                 let config = self.read_gemini_live()?;
@@ -2559,6 +2554,29 @@ impl ProxyService {
             }
             _ => Ok(false),
         }
+    }
+
+    pub(crate) async fn codex_snapshot_matches_current_proxy(
+        &self,
+        config: &Value,
+    ) -> Result<bool, String> {
+        if !Self::is_codex_live_taken_over(config) {
+            return Ok(false);
+        }
+        let (_, base) = self.build_proxy_urls().await?;
+        Ok(Self::codex_live_matches_proxy(config, &base))
+    }
+
+    fn codex_live_matches_proxy(config: &Value, base: &str) -> bool {
+        Self::is_codex_live_taken_over(config)
+            && config
+                .get("config")
+                .and_then(Value::as_str)
+                .is_some_and(|text| {
+                    Self::codex_config_has_base_url_matching(text, |url| {
+                        Self::proxy_urls_match(url, base)
+                    })
+                })
     }
 
     fn cleanup_claude_takeover_placeholders_in_live(&self) -> Result<(), String> {

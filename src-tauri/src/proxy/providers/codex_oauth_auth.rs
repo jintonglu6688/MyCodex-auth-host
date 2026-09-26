@@ -32,6 +32,10 @@ use uuid::Uuid;
 
 use super::copilot_auth::{GitHubAccount, GitHubDeviceCodeResponse};
 
+#[path = "codex_oauth_import.rs"]
+mod existing_login;
+pub(crate) use existing_login::existing_login_identity;
+
 /// OpenAI OAuth 客户端 ID（OpenCode 使用，与官方 Codex CLI 相同）
 const CODEX_CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
 
@@ -89,6 +93,12 @@ pub enum CodexOAuthError {
 
     #[error("codex_oauth_duplicate_account")]
     DuplicateAccount,
+
+    #[error("现有 ChatGPT 文件登录材料不完整或身份不一致，请重新登录")]
+    ExistingLoginInvalid,
+
+    #[error("现有 ChatGPT 登录凭据代际无法安全确定，请重新登录")]
+    ExistingLoginConflict,
 
     #[error("Refresh Token 失效或已过期")]
     RefreshTokenInvalid,
@@ -278,7 +288,7 @@ struct AccountLoginContext<'a> {
 }
 
 /// 持久化的账号数据
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct CodexAccountData {
     /// 本地稳定账号 ID（同时作为 HashMap 的 key）
     pub account_id: String,
@@ -1326,10 +1336,10 @@ impl CodexOAuthManager {
                     // Matching material establishes one generation, so dating
                     // it cannot turn an unresolved R0/R1 conflict into a false
                     // "live is older" decision on the next retry.
-                    account.token_updated_at_ms = last_refresh_ms
-                        .filter(|observed| *observed > 0)
-                        .unwrap_or_else(|| chrono::Utc::now().timestamp_millis());
-                    changed = true;
+                    if let Some(observed) = last_refresh_ms.filter(|observed| *observed > 0) {
+                        account.token_updated_at_ms = observed;
+                        changed = true;
+                    }
                 } else if let Some(observed) = last_refresh_ms {
                     if observed > account.token_updated_at_ms {
                         account.token_updated_at_ms = observed;
@@ -2015,9 +2025,8 @@ impl CodexOAuthManager {
             file.write_all(content.as_bytes())?;
             file.flush()?;
 
-            if self.storage_path.exists() {
-                let _ = fs::remove_file(&self.storage_path);
-            }
+            // Windows rename replaces an existing file atomically. Removing it
+            // first loses the old credential store if replacement fails.
             fs::rename(&tmp_path, &self.storage_path)?;
         }
 

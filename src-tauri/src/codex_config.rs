@@ -483,11 +483,11 @@ pub(crate) fn codex_managed_oauth_live_auth_marker_exists() -> bool {
 
 /// 从 live/备份的 Codex `auth` 中提取上游 ChatGPT workspace ID。
 ///
-/// 仅接受 ChatGPT 登录形状（`auth_mode == "chatgpt"`、`OPENAI_API_KEY` 可清空）。
+/// 接受显式或旧式隐式 ChatGPT 登录形状；API/外部 token 模式仍排除。
 /// 托管账号写入的完整 bundle 会额外带 `tokens.refresh_token` 与顶层 `last_refresh`，
 /// 这里一并容忍。Codex CLI 自刷新会轮换 access_token，因此短期 token 指纹不能
 /// 作为稳定的所有权谓词；cc-switch 的本地账号 ID 单独记录在 marker 中。
-fn extract_codex_managed_oauth_account_id(auth: &Value) -> Option<String> {
+pub(crate) fn extract_codex_managed_oauth_account_id(auth: &Value) -> Option<String> {
     let auth_obj = auth.as_object()?;
 
     if auth_obj.keys().any(|key| {
@@ -499,7 +499,10 @@ fn extract_codex_managed_oauth_account_id(auth: &Value) -> Option<String> {
         return None;
     }
 
-    if auth.get("auth_mode").and_then(|value| value.as_str()) != Some("chatgpt") {
+    if !matches!(
+        codex_auth_resolved_mode(auth_obj),
+        CodexResolvedAuthMode::Chatgpt
+    ) {
         return None;
     }
 
@@ -2340,7 +2343,7 @@ fn codex_model_catalog_from_settings(
     )))
 }
 
-fn set_codex_model_catalog_json_field(
+pub(crate) fn set_codex_model_catalog_json_field(
     config_text: &str,
     catalog_path: Option<&Path>,
 ) -> Result<String, AppError> {
@@ -4765,6 +4768,56 @@ base_url = "https://single.example.com/v1"
             err.to_string().contains("config.toml"),
             "error should explain missing config.toml, got: {err}"
         );
+    }
+
+    #[test]
+    #[serial]
+    fn implicit_chatgpt_marker_keeps_refresh_ownership_after_cli_rotation() {
+        let _home = CodexLiveTestHome::new();
+        for mode in [None, Some(Value::Null)] {
+            let mut auth = codex_managed_oauth_auth_value(
+                "workspace",
+                "access-0",
+                Some(&test_codex_id_token("user")),
+                "refresh-0",
+                "2026-01-01T00:00:00Z",
+            );
+            match mode {
+                Some(value) => {
+                    auth["auth_mode"] = value;
+                }
+                None => {
+                    auth.as_object_mut().unwrap().remove("auth_mode");
+                }
+            }
+            record_codex_managed_oauth_live_auth(&auth, "local-id").unwrap();
+            auth["tokens"]["refresh_token"] = json!("refresh-1");
+            auth["tokens"]["access_token"] = json!("access-1");
+            auth["last_refresh"] = json!("2026-01-02T00:00:00Z");
+            crate::config::write_json_file(&get_codex_auth_path(), &auth).unwrap();
+            assert_eq!(
+                read_codex_live_auth_refresh_for_account("local-id")
+                    .unwrap()
+                    .0,
+                "refresh-1"
+            );
+            for invalid_mode in ["apikey", "chatgptAuthTokens", "headers"] {
+                let mut invalid = auth.clone();
+                invalid["auth_mode"] = json!(invalid_mode);
+                assert!(!codex_live_auth_is_managed_chatgpt_login(
+                    &invalid, "local-id"
+                ));
+            }
+            for api_key in ["secret", "PROXY_MANAGED", ""] {
+                let mut invalid = auth.clone();
+                invalid["OPENAI_API_KEY"] = json!(api_key);
+                assert!(!codex_live_auth_is_managed_chatgpt_login(
+                    &invalid, "local-id"
+                ));
+            }
+            auth["tokens"]["id_token"] = json!(test_codex_id_token("different-user"));
+            assert!(!codex_live_auth_is_managed_chatgpt_login(&auth, "local-id"));
+        }
     }
 
     #[test]

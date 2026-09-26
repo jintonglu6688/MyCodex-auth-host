@@ -27,6 +27,8 @@ impl Gui {
             .env("HOME", self.root.path().join("home"))
             .env("USERPROFILE", self.root.path().join("home"))
             .env("LOCALAPPDATA", self.root.path().join("home"))
+            .env("MYCODEX_SYNTHETIC_CAPTURE_KEY", "synthetic-secret-env")
+            .env_remove("MYCODEX_SYNTHETIC_MISSING_KEY")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
@@ -113,6 +115,294 @@ fn switch_gui(gui: &Gui, id: &str, operation: &str) {
         json!({"providerId":id,"operationId":operation,
         "expectedVersion":selected["version"],"expectedFingerprint":preflight["fingerprint"]}),
     );
+}
+
+fn external_api(gui: &Gui, key: &str, model: &str) -> (Vec<u8>, Vec<u8>) {
+    let config = format!("model='{model}'\nmodel_provider='external'\nmodel_reasoning_summary='detailed'\n[model_providers.external]\nbase_url='https://external.invalid/v1'\nwire_api='responses'\nrequires_openai_auth=true\n[mcp_servers.probe]\nurl='https://mcp.invalid'\nenabled=false\n");
+    let auth = json!({"auth_mode":"apikey","OPENAI_API_KEY":key}).to_string();
+    std::fs::write(gui.root.path().join("codex/config.toml"), &config).unwrap();
+    std::fs::write(gui.root.path().join("codex/auth.json"), &auth).unwrap();
+    (config.into_bytes(), auth.into_bytes())
+}
+
+fn assert_live_unchanged(gui: &Gui, before: &(Vec<u8>, Vec<u8>)) {
+    assert_eq!(
+        std::fs::read(gui.root.path().join("codex/config.toml")).unwrap(),
+        before.0
+    );
+    assert_eq!(
+        std::fs::read(gui.root.path().join("codex/auth.json")).unwrap(),
+        before.1
+    );
+}
+
+#[test]
+fn auto_capture_api_reuses_identity_and_preserves_external_switch_and_tools() {
+    let mut gui = Gui::new();
+    let initial = external_api(&gui, "synthetic-secret-a", "model-a");
+    gui.start();
+    let first = gui.ok("gui/provider/list", json!({}));
+    let a = first["currentProviderId"].as_str().unwrap().to_string();
+    assert_eq!(first["providers"].as_array().unwrap().len(), 1);
+    assert_eq!(first["liveState"], "current");
+    assert_live_unchanged(&gui, &initial);
+    assert_eq!(
+        gui.ok("gui/mcp/list", json!({}))["servers"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    let changed = external_api(&gui, "synthetic-secret-a", "model-edited");
+    let edited = gui.ok("gui/provider/list", json!({}));
+    assert_eq!(edited["currentProviderId"], a);
+    assert_eq!(edited["providers"][0]["model"], "model-edited");
+    let b_live = external_api(&gui, "synthetic-secret-b", "model-b");
+    let second = gui.ok("gui/provider/list", json!({}));
+    let b = second["currentProviderId"].as_str().unwrap().to_string();
+    assert_ne!(a, b);
+    assert_eq!(second["providers"].as_array().unwrap().len(), 2);
+    let saved_a = gui.ok("gui/provider/get", json!({"providerId":a}));
+    assert_eq!(
+        saved_a["model"], "model-a",
+        "external B must not be backfilled into A"
+    );
+    assert_live_unchanged(&gui, &b_live);
+    gui.stop();
+    gui.start();
+    assert_eq!(
+        gui.ok("gui/provider/list", json!({}))["currentProviderId"],
+        b
+    );
+    assert_live_unchanged(&gui, &b_live);
+    external_api(&gui, "synthetic-secret-a", "model-edited");
+    let returned = gui.ok("gui/provider/list", json!({}));
+    assert_eq!(returned["currentProviderId"], a);
+    assert_eq!(returned["providers"].as_array().unwrap().len(), 2);
+    assert_live_unchanged(&gui, &changed);
+}
+
+fn external_account(gui: &Gui, subject: &str, workspace: &str, model: &str) -> (Vec<u8>, Vec<u8>) {
+    use base64::Engine;
+    let claims = json!({"sub":subject,"email":format!("{subject}@example.invalid"),
+        "https://api.openai.com/auth":{"chatgpt_account_id":workspace},"exp":4102444800_i64});
+    let token = format!(
+        "{}.{}.signature",
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(br#"{"alg":"none"}"#),
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(claims.to_string())
+    );
+    let auth = json!({"tokens":{"account_id":workspace,"id_token":token,"access_token":token,
+        "refresh_token":format!("synthetic-secret-{subject}")},"last_refresh":"2024-01-01T00:00:00Z"}).to_string();
+    let config = format!("model='{model}'\nmodel_reasoning_summary='detailed'\n");
+    std::fs::write(gui.root.path().join("codex/config.toml"), &config).unwrap();
+    std::fs::write(gui.root.path().join("codex/auth.json"), &auth).unwrap();
+    (config.into_bytes(), auth.into_bytes())
+}
+
+#[test]
+fn auto_capture_accounts_bind_uuid_and_never_replace_previous_identity() {
+    let mut gui = Gui::new();
+    let a_live = external_account(&gui, "alice", "team", "model-a");
+    gui.start();
+    let a = gui.ok("gui/provider/list", json!({}));
+    assert_eq!(a["providers"][0]["kind"], "chatgpt", "{a}");
+    assert_eq!(a["providers"][0]["accountLabel"], "alice@example.invalid");
+    assert_live_unchanged(&gui, &a_live);
+    let b_live = external_account(&gui, "bob", "team", "model-b");
+    let b = gui.ok("gui/provider/list", json!({}));
+    assert_eq!(b["providers"].as_array().unwrap().len(), 2);
+    assert_ne!(a["currentProviderId"], b["currentProviderId"]);
+    assert_eq!(
+        gui.ok("gui/account/list", json!({}))["accounts"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
+    assert_live_unchanged(&gui, &b_live);
+    external_account(&gui, "alice", "team", "model-a");
+    let returned = gui.ok("gui/provider/list", json!({}));
+    assert_eq!(returned["currentProviderId"], a["currentProviderId"]);
+    assert_eq!(returned["providers"].as_array().unwrap().len(), 2);
+    gui.stop();
+    gui.start();
+    assert_eq!(
+        gui.ok("gui/provider/list", json!({}))["providers"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
+    assert_live_unchanged(&gui, &a_live);
+}
+
+#[test]
+fn auto_capture_unknown_live_keeps_saved_list_and_refuses_stale_edit() {
+    let mut gui = Gui::new();
+    external_api(&gui, "synthetic-secret-a", "model-a");
+    gui.start();
+    let initial = gui.ok("gui/provider/list", json!({}));
+    let id = initial["currentProviderId"].as_str().unwrap();
+    std::fs::write(gui.root.path().join("codex/config.toml"), "[broken").unwrap();
+    let result = gui.ok("gui/provider/list", json!({}));
+    assert_eq!(result["liveState"], "unavailable");
+    assert_eq!(result["currentProviderId"], "");
+    assert_eq!(result["providers"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        gui.ok("gui/provider/get", json!({"providerId":id}))["model"],
+        "model-a"
+    );
+    assert_eq!(
+        gui.call("gui/provider/save", save(id))["error"]["message"],
+        "invalid_live_config"
+    );
+    gui.stop();
+    gui.start();
+    assert_eq!(
+        gui.ok("gui/provider/list", json!({}))["liveState"],
+        "unavailable"
+    );
+}
+
+#[test]
+fn auto_capture_external_direct_retires_old_route_without_restoring_backup() {
+    let mut gui = Gui::new();
+    gui.start();
+    gui.ok("gui/provider/save", save("direct"));
+    let mut edit = save("routed");
+    edit["kind"] = json!("chat_completions");
+    gui.ok("gui/provider/save", edit);
+    switch_gui(&gui, "routed", "route");
+    let self_route = gui.ok("gui/provider/list", json!({}));
+    assert_eq!(self_route["providers"].as_array().unwrap().len(), 2);
+    assert_eq!(self_route["route"]["accepting"], true);
+    let external = external_api(&gui, "synthetic-secret-external", "external-model");
+    let captured = gui.ok("gui/provider/list", json!({}));
+    assert_eq!(captured["route"]["running"], false);
+    assert_eq!(captured["route"]["takeover"], false);
+    assert_eq!(captured["providers"].as_array().unwrap().len(), 3);
+    assert_live_unchanged(&gui, &external);
+    gui.stop();
+    gui.start();
+    assert_eq!(
+        gui.ok("gui/provider/list", json!({}))["currentProviderId"],
+        captured["currentProviderId"]
+    );
+    assert_live_unchanged(&gui, &external);
+}
+
+#[test]
+fn auto_capture_uses_effective_credentials_and_preserves_private_url_on_edit() {
+    let mut gui = Gui::new();
+    external_account(&gui, "unused", "workspace", "model-a");
+    let path = gui.root.path().join("codex/config.toml");
+    let config = "model='model-a'\nmodel_provider='external'\n[model_providers.external]\nbase_url='https://external.invalid/v1?key=synthetic-secret-query'\nwire_api='responses'\nrequires_openai_auth=false\nenv_key='MYCODEX_SYNTHETIC_CAPTURE_KEY'\nexperimental_bearer_token='synthetic-secret-unused'\n";
+    std::fs::write(&path, config).unwrap();
+    gui.start();
+    let first = gui.ok("gui/provider/list", json!({}));
+    let id = first["currentProviderId"].as_str().unwrap();
+    assert_eq!(first["providers"][0]["kind"], "responses");
+    assert_eq!(
+        gui.ok("gui/account/list", json!({}))["accounts"],
+        json!([]),
+        "unused auth.json is not a login to import"
+    );
+    assert_eq!(gui.config(), config);
+    std::fs::write(
+        &path,
+        config.replace("synthetic-secret-unused", "synthetic-secret-other"),
+    )
+    .unwrap();
+    let list = gui.ok("gui/provider/list", json!({}));
+    assert_eq!(
+        list["currentProviderId"], id,
+        "env reference takes precedence over bearer"
+    );
+    let mut edit = gui.ok("gui/provider/get", json!({"providerId":id}));
+    edit["expectedVersion"] = edit["version"].clone();
+    edit["name"] = json!("Renamed");
+    gui.ok("gui/provider/save", edit);
+    assert!(gui.config().contains("key=synthetic-secret-query"));
+    let parsed: toml::Value = toml::from_str(&gui.config()).unwrap();
+    assert_eq!(
+        parsed["model_providers"]["external"]["requires_openai_auth"].as_bool(),
+        Some(false)
+    );
+    std::fs::write(
+        &path,
+        config.replace(
+            "MYCODEX_SYNTHETIC_CAPTURE_KEY",
+            "MYCODEX_SYNTHETIC_MISSING_KEY",
+        ),
+    )
+    .unwrap();
+    let unavailable = gui.ok("gui/provider/list", json!({}));
+    assert_eq!(unavailable["syncError"], "credential_reference_unavailable");
+    assert_eq!(unavailable["currentProviderId"], "");
+    assert_eq!(unavailable["providers"].as_array().unwrap().len(), 1);
+}
+
+#[test]
+fn auto_capture_distinguishes_saved_variants_of_one_identity() {
+    let mut gui = Gui::new();
+    gui.start();
+    let mut a = save("variant-a");
+    a["models"] = json!([]);
+    let mut b = a.clone();
+    b["id"] = json!("variant-b");
+    b["name"] = json!("variant-b");
+    b["model"] = json!("model-b");
+    gui.ok("gui/provider/save", a);
+    gui.ok("gui/provider/save", b);
+    switch_gui(&gui, "variant-b", "activate-b");
+    let b_config = gui.config();
+    switch_gui(&gui, "variant-a", "activate-a");
+    // External tools may change the display label without changing the route.
+    std::fs::write(
+        gui.root.path().join("codex/config.toml"),
+        b_config.replace("variant-b", "External display label"),
+    )
+    .unwrap();
+    let current = gui.ok("gui/provider/list", json!({}));
+    assert_eq!(current["currentProviderId"], "variant-b");
+    assert_eq!(current["providers"].as_array().unwrap().len(), 2);
+}
+
+#[test]
+fn auto_capture_retries_partial_private_commits_without_duplicating_login_or_provider() {
+    let mut gui = Gui::new();
+    gui.start();
+    let db = rusqlite::Connection::open(gui.root.path().join("store/cc-switch.db")).unwrap();
+    db.execute_batch("CREATE TRIGGER fail_capture BEFORE INSERT ON providers BEGIN SELECT RAISE(ABORT,'synthetic failure'); END;").unwrap();
+    let original = external_account(&gui, "partial", "team", "model-a");
+    let failed = gui.ok("gui/provider/list", json!({}));
+    assert_eq!(failed["liveState"], "unavailable");
+    assert_eq!(failed["providers"].as_array().unwrap().len(), 0);
+    assert_eq!(
+        gui.ok("gui/account/list", json!({}))["accounts"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_live_unchanged(&gui, &original);
+    db.execute_batch("DROP TRIGGER fail_capture; CREATE TRIGGER fail_current BEFORE UPDATE OF is_current ON providers WHEN NEW.is_current=1 BEGIN SELECT RAISE(ABORT,'synthetic failure'); END;").unwrap();
+    let failed = gui.ok("gui/provider/list", json!({}));
+    assert_eq!(failed["liveState"], "unavailable");
+    assert_eq!(failed["providers"].as_array().unwrap().len(), 1);
+    assert_live_unchanged(&gui, &original);
+    db.execute_batch("DROP TRIGGER fail_current;").unwrap();
+    let recovered = gui.ok("gui/provider/list", json!({}));
+    assert_eq!(recovered["liveState"], "current");
+    assert_eq!(recovered["providers"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        gui.ok("gui/account/list", json!({}))["accounts"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_live_unchanged(&gui, &original);
 }
 
 #[test]

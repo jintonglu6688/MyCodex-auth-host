@@ -138,6 +138,7 @@ pub(super) fn handle(host: &Host, method: &str, params: &Value) -> Result<Value>
         return Err("method_not_supported");
     }
     let _guard = lifecycle::mutation()?;
+    super::auto_capture::before_write(&host.state)?;
     if params["expectedVersion"].as_str() != Some(version(host)?.as_str()) {
         return Err("version_conflict");
     }

@@ -336,6 +336,86 @@ fn takeover(state: &AppState) -> Result<bool> {
             .detect_takeover_in_live_config_for_app(&AppType::Codex))
 }
 
+pub(super) fn owns_live(state: &AppState) -> Result<bool> {
+    if !state
+        .proxy_service
+        .detect_takeover_in_live_config_for_app(&AppType::Codex)
+    {
+        return Ok(false);
+    }
+    let live =
+        ProviderService::read_live_settings(AppType::Codex).map_err(|_| "invalid_live_config")?;
+    owns_snapshot(state, &live)
+}
+
+pub(super) fn owns_snapshot(state: &AppState, live: &Value) -> Result<bool> {
+    Ok(block_on(
+        state
+            .proxy_service
+            .codex_snapshot_matches_current_proxy(live),
+    )
+    .map_err(|_| "invalid_live_config")?
+        && live["config"]
+            .as_str()
+            .is_some_and(live_route_token_matches))
+}
+
+pub(super) fn pause_if_external(state: &AppState) {
+    if ROUTING.load(Ordering::Acquire) && !matches!(owns_live(state), Ok(true)) {
+        ROUTING.store(false, Ordering::Release);
+    }
+}
+
+pub(super) fn resume_owned(state: &AppState) -> Result<()> {
+    if !owns_live(state)? {
+        return Err("route_live_changed_externally");
+    }
+    ROUTING.store(
+        block_on(state.proxy_service.is_running()),
+        Ordering::Release,
+    );
+    Ok(())
+}
+
+// Called with the request write gate held and after validating external live.
+// Native disable_takeover restores its backup: that would overwrite the external switch.
+pub(super) fn detach_external(state: &AppState) -> Result<()> {
+    if owns_live(state)? {
+        return Err("route_live_changed_externally");
+    }
+    ROUTING.store(false, Ordering::Release);
+    if block_on(state.proxy_service.is_running()) {
+        block_on(state.proxy_service.stop()).map_err(|_| "route_stop_failed")?;
+    }
+    let mut app = block_on(state.db.get_proxy_config_for_app("codex")).map_err(service_error)?;
+    if app.enabled {
+        app.enabled = false;
+        block_on(state.db.update_proxy_config_for_app(app)).map_err(service_error)?;
+    }
+    if block_on(state.db.get_live_backup("codex"))
+        .map_err(service_error)?
+        .is_some()
+    {
+        block_on(state.db.delete_live_backup("codex")).map_err(service_error)?;
+    }
+    let mut global = block_on(state.db.get_global_proxy_config()).map_err(service_error)?;
+    if global.proxy_enabled {
+        global.proxy_enabled = false;
+        block_on(state.db.update_global_proxy_config(global)).map_err(service_error)?;
+    }
+    Ok(())
+}
+
+// An explicit maintenance stop must remain possible with malformed/foreign live.
+// Retain recovery records; startup validates them before ever writing live again.
+pub(super) fn stop_listener(state: &AppState) -> Result<()> {
+    ROUTING.store(false, Ordering::Release);
+    if block_on(state.proxy_service.is_running()) {
+        block_on(state.proxy_service.stop()).map_err(|_| "route_stop_failed")?;
+    }
+    Ok(())
+}
+
 pub(super) fn stop(state: &AppState) -> Result<()> {
     ROUTING.store(false, Ordering::Release);
     if takeover(state)? {
@@ -381,6 +461,9 @@ pub(super) fn capture_current_common(state: &AppState) -> Result<()> {
     }
     let live =
         ProviderService::read_live_settings(AppType::Codex).map_err(|_| "invalid_live_config")?;
+    if !routed {
+        super::auto_capture::require_live_owner(state, &provider, &live)?;
+    }
     let previous = state
         .db
         .get_config_snippet("codex")
@@ -444,6 +527,9 @@ pub(super) fn reconcile(state: &AppState) -> Result<()> {
         .transpose()?
         .unwrap_or(false)
     {
+        let live = ProviderService::read_live_settings(AppType::Codex)
+            .map_err(|_| "invalid_live_config")?;
+        super::auto_capture::require_live_owner(state, provider.as_ref().unwrap(), &live)?;
         // Failure must never leave a live listener forwarding to a direct card.
         ROUTING.store(false, Ordering::Release);
         if block_on(state.proxy_service.set_takeover_for_app("codex", true)).is_err() {
@@ -463,6 +549,10 @@ pub(super) fn reconcile(state: &AppState) -> Result<()> {
 
 pub(super) fn restore(host: &Host) -> Result<()> {
     let state = &host.state;
+    let captured = super::auto_capture::read(state)?;
+    if captured.error.is_some() {
+        return Ok(());
+    }
     let _guard = mutation()?;
     if !takeover(state)? {
         return Ok(());

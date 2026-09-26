@@ -36,8 +36,10 @@ pub(super) fn snapshot(state: &AppState, provider: &Provider) -> Result<Provider
             .proxy_service
             .detect_takeover_in_live_config_for_app(&AppType::Codex)
     {
-        let live = ProviderService::read_live_settings(AppType::Codex)
-            .map_err(|_| "invalid_live_config")?;
+        let Some(live) = super::auto_capture::owned_snapshot(state, provider).unwrap_or(None)
+        else {
+            return Ok(edited);
+        };
         let live = crate::services::provider::strip_common_config_from_live_settings(
             &state.db,
             &AppType::Codex,
@@ -99,14 +101,11 @@ pub(super) fn summary(state: &AppState, stored: &Provider, edited: &Provider) ->
     let (base, key) = edited.resolve_usage_credentials(&AppType::Codex);
     if !base.is_empty() {
         let url = reqwest::Url::parse(&base).map_err(|_| "invalid_base_url")?;
-        if !url.username().is_empty()
-            || url.password().is_some()
-            || url.query().is_some()
-            || url.fragment().is_some()
-        {
+        if !url.username().is_empty() || url.password().is_some() || url.fragment().is_some() {
             return Err("invalid_base_url");
         }
     }
+    let base = masked_url(&base);
     let base = if edited
         .meta
         .as_ref()
@@ -142,6 +141,24 @@ pub(super) fn summary(state: &AppState, stored: &Provider, edited: &Provider) ->
         "needsReauthentication":account_id.is_some() && account.is_none_or(|a|a.reauth_required),
         "commonConfigEnabled":edited.meta.as_ref().and_then(|m|m.common_config_enabled).unwrap_or(true),
         "models":masked(&json!(gui_catalog::read_models(edited)?)),"advanced":masked(&read_advanced(edited)?)}))
+}
+
+fn masked_url(base: &str) -> String {
+    let Ok(mut url) = reqwest::Url::parse(base) else {
+        return base.to_string();
+    };
+    if url.query().is_none() {
+        return base.to_string();
+    }
+    let keys = url
+        .query_pairs()
+        .map(|(key, _)| key.into_owned())
+        .collect::<Vec<_>>();
+    url.set_query(None);
+    for key in keys {
+        url.query_pairs_mut().append_pair(&key, "********");
+    }
+    url.to_string()
 }
 
 fn config(provider: &Provider) -> Result<toml::Value> {
@@ -288,7 +305,7 @@ pub(super) fn edit(mut provider: Provider, params: &Value) -> Result<Provider> {
         .unwrap_or_else(|| previous_advanced.clone());
     restore_masks(&mut advanced, Some(&previous_advanced))?;
     validate_advanced(&advanced)?;
-    let (_, stored_key) = provider.resolve_usage_credentials(&AppType::Codex);
+    let (stored_base, stored_key) = provider.resolve_usage_credentials(&AppType::Codex);
     let key = if params["clearApiKey"] == true {
         ""
     } else {
@@ -337,13 +354,17 @@ pub(super) fn edit(mut provider: Provider, params: &Value) -> Result<Provider> {
         document.remove("base_url");
         provider.settings_config["auth"] = json!({});
     } else {
-        let base = params["baseUrl"].as_str().ok_or("invalid_base_url")?;
+        let requested_base = params["baseUrl"].as_str().ok_or("invalid_base_url")?;
+        let base = if requested_base == masked_url(&stored_base) {
+            stored_base.as_str()
+        } else {
+            requested_base
+        };
         let url = reqwest::Url::parse(base).map_err(|_| "invalid_base_url")?;
         if !matches!(url.scheme(), "http" | "https")
             || url.host_str().is_none()
             || !url.username().is_empty()
             || url.password().is_some()
-            || url.query().is_some()
             || url.fragment().is_some()
         {
             return Err("invalid_base_url");
@@ -377,6 +398,9 @@ pub(super) fn edit(mut provider: Provider, params: &Value) -> Result<Provider> {
             .get_mut(&source)
             .and_then(toml_edit::Item::as_table_like_mut)
             .ok_or("invalid_config")?;
+        let preserve_auth_source = table.contains_key("base_url")
+            && params["apiKey"].as_str().is_none_or(|key| key.is_empty())
+            && params["clearApiKey"] != true;
         table.insert("name", toml_edit::value(name));
         let base = if advanced["isFullUrl"] == true && format == "openai_responses" {
             base.strip_suffix("/responses").ok_or("invalid_base_url")?
@@ -385,7 +409,9 @@ pub(super) fn edit(mut provider: Provider, params: &Value) -> Result<Provider> {
         };
         table.insert("base_url", toml_edit::value(base));
         table.insert("wire_api", toml_edit::value("responses"));
-        table.insert("requires_openai_auth", toml_edit::value(true));
+        if !preserve_auth_source {
+            table.insert("requires_openai_auth", toml_edit::value(true));
+        }
         if params.get("apiKey").is_some() || params["clearApiKey"] == true {
             table.remove("experimental_bearer_token");
         }

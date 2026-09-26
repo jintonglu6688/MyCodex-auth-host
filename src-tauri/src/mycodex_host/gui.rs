@@ -1,6 +1,7 @@
 //! GUI RPC projection. Native services own persistence and switching semantics.
 use super::{
-    gui_accounts, gui_catalog, gui_provider as form, lifecycle, service_error, Host, Result,
+    auto_capture, gui_accounts, gui_catalog, gui_provider as form, lifecycle, service_error, Host,
+    Result,
 };
 use crate::{AppType, McpService, Provider, ProviderService};
 use serde_json::{json, Value};
@@ -62,31 +63,45 @@ pub(super) fn handle(host: &Host, method: &str, params: &Value) -> Result<Value>
         "gui/model/fetch" => gui_catalog::fetch_models(state, params),
         method if method.starts_with("gui/mcp/") => super::gui_mcp::handle(host, method, params),
         "gui/provider/list" => {
-            let current = ProviderService::current(state, AppType::Codex).map_err(service_error)?;
+            let captured = auto_capture::read(state)?;
+            let current = captured.current;
             let mut current_version = String::new();
             let mut rows = Vec::new();
             for stored in ProviderService::list(state, AppType::Codex)
                 .map_err(service_error)?
                 .values()
             {
-                let edited = form::snapshot(state, stored)?;
+                let edited = if current == stored.id && captured.error.is_none() {
+                    form::snapshot(state, stored)?
+                } else {
+                    stored.clone()
+                };
                 let row = form::summary(state, stored, &edited)?;
                 if stored.id == current {
                     current_version = form::version(stored, &edited);
                 }
                 rows.push(row);
             }
+            let account_label = rows
+                .iter()
+                .find(|row| row["id"].as_str() == Some(current.as_str()))
+                .and_then(|row| row.get("accountLabel"))
+                .cloned()
+                .unwrap_or(Value::Null);
             Ok(
                 json!({"providers":rows,"currentProviderId":current,"currentProviderVersion":current_version,
-                "liveState":"managed","liveAccountLabel":null,"syncError":null}),
+                "liveState":captured.state,"liveAccountLabel":account_label,"syncError":captured.error,
+                "route":lifecycle::status(state)?}),
             )
         }
         "gui/provider/get" => {
+            auto_capture::read(state)?;
             let (stored, edited) = selected(host, params, false)?;
             form::summary(state, &stored, &edited)
         }
         "gui/provider/save" => {
             let _guard = lifecycle::mutation()?;
+            auto_capture::before_write(state)?;
             let id = params["id"].as_str().ok_or("invalid_params")?;
             valid_id(id)?;
             let previous = state
@@ -161,13 +176,17 @@ pub(super) fn handle(host: &Host, method: &str, params: &Value) -> Result<Value>
                 McpService::sync_enabled_for_app(state, &AppType::Codex)
                     .map_err(|_| "save_outcome_unknown")?;
             }
+            if result.is_err() && applied {
+                lifecycle::stop_listener(state).map_err(|_| "save_outcome_unknown")?;
+            }
+            // A failed native write must never reapply an old conversion row.
+            result.map_err(|_| "save_outcome_unknown")?;
             let reconciled = if applied {
                 lifecycle::reconcile(state)
             } else {
                 Ok(())
             };
             // A native write may have occurred before either error; never advertise safe retry.
-            result.map_err(|_| "save_outcome_unknown")?;
             reconciled.map_err(|_| "save_outcome_unknown")?;
             let stored = form::stored(state, id).map_err(|_| "save_outcome_unknown")?;
             let edited = form::snapshot(state, &stored).map_err(|_| "save_outcome_unknown")?;
@@ -178,6 +197,7 @@ pub(super) fn handle(host: &Host, method: &str, params: &Value) -> Result<Value>
         }
         "gui/provider/copy" => {
             let _guard = lifecycle::mutation()?;
+            auto_capture::before_write(state)?;
             let (_, mut edited) = selected(host, params, true)?;
             let id = params["newId"].as_str().ok_or("invalid_params")?;
             let name = params["name"].as_str().ok_or("invalid_params")?;
@@ -205,6 +225,7 @@ pub(super) fn handle(host: &Host, method: &str, params: &Value) -> Result<Value>
         }
         "gui/provider/delete" => {
             let _guard = lifecycle::mutation()?;
+            auto_capture::before_write(state)?;
             let (stored, _) = selected(host, params, true)?;
             if ProviderService::current(state, AppType::Codex).map_err(service_error)? == stored.id
                 || state
@@ -220,6 +241,8 @@ pub(super) fn handle(host: &Host, method: &str, params: &Value) -> Result<Value>
             Ok(json!({"accountRemoved":false}))
         }
         "gui/provider/preflight" => {
+            let _guard = lifecycle::mutation()?;
+            auto_capture::before_write(state)?;
             let (stored, edited) = selected(host, params, true)?;
             lifecycle::conversion(&edited)?;
             Ok(
@@ -240,6 +263,7 @@ pub(super) fn handle(host: &Host, method: &str, params: &Value) -> Result<Value>
                     return response.clone().ok_or("operation_unknown");
                 }
             }
+            auto_capture::before_write(state)?;
             let (stored, edited) = selected(host, params, true)?;
             if params["expectedFingerprint"].as_str() != Some(fingerprint(host)?.as_str()) {
                 return Err("config_conflict");
@@ -261,9 +285,11 @@ pub(super) fn handle(host: &Host, method: &str, params: &Value) -> Result<Value>
             lifecycle::capture_current_common(state)?;
             lifecycle::prepare(state, &edited)?;
             let result = ProviderService::switch(state, AppType::Codex, &stored.id);
-            let reconciled = lifecycle::reconcile(state);
+            if result.is_err() {
+                lifecycle::stop_listener(state).map_err(|_| "operation_unknown")?;
+            }
             result.map_err(|_| "operation_unknown")?;
-            reconciled.map_err(|_| "operation_unknown")?;
+            lifecycle::reconcile(state).map_err(|_| "operation_unknown")?;
             let response =
                 json!({"operationId":operation,"providerId":stored.id,"status":"applied"});
             if let Some((_, receipt)) = host

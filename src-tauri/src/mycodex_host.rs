@@ -10,6 +10,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, OnceLock};
 
 mod accounts;
+pub(crate) mod auto_capture;
 mod gui;
 mod gui_accounts;
 mod gui_catalog;
@@ -17,8 +18,8 @@ mod gui_mcp;
 mod gui_provider;
 mod identity;
 mod ipc;
-mod paths;
 pub(crate) mod lifecycle;
+mod paths;
 mod security;
 
 type Result<T> = std::result::Result<T, &'static str>;
@@ -153,7 +154,10 @@ fn initialize_state() -> Result<Arc<Host>> {
         _ => (),
     }
     lifecycle::configure(&state)?;
-    Ok(Arc::new(Host { state, gui: Default::default() }))
+    Ok(Arc::new(Host {
+        state,
+        gui: Default::default(),
+    }))
 }
 
 fn parse_request(bytes: &[u8]) -> Result<Request> {
@@ -193,19 +197,54 @@ fn output(response: &Value) -> Result<()> {
 fn handle(host: &Host, request: &Request, resident: bool) -> Result<Value> {
     let state = &host.state;
     let p = &request.params;
+    if matches!(
+        request.method.as_str(),
+        "provider/add"
+            | "provider/update"
+            | "provider/switch"
+            | "gui/provider/save"
+            | "gui/provider/copy"
+            | "gui/provider/delete"
+            | "gui/provider/apply"
+            | "gui/provider/preflight"
+            | "gui/account/delete"
+            | "account/remove"
+            | "backend/shutdown"
+            | "mcp/import"
+            | "gui/mcp/import"
+            | "gui/mcp/save"
+            | "gui/mcp/delete"
+    ) {
+        lifecycle::pause_if_external(state);
+    }
     match request.method.as_str() {
         "status" => {
             let mut value = identity::target_identity()?;
-            value["stage"] = json!(if resident {"upstream-core-resident"} else {"upstream-core-probe"});
+            value["stage"] = json!(if resident {
+                "upstream-core-resident"
+            } else {
+                "upstream-core-probe"
+            });
             value["capabilities"] = json!(if resident {
-                vec!["codexNativeServices","codexManagedAccounts","codexConversionLifecycle","commonConfig","guiProviderManagement","guiMcpManagement"]
-            } else {vec!["codexNativeServices"]});
+                vec![
+                    "codexNativeServices",
+                    "codexManagedAccounts",
+                    "codexConversionLifecycle",
+                    "commonConfig",
+                    "guiProviderManagement",
+                    "guiMcpManagement",
+                    "globalAuthCapture",
+                ]
+            } else {
+                vec!["codexNativeServices"]
+            });
             value["route"] = lifecycle::status(state)?;
             Ok(value)
         }
         "provider/list" => {
+            let captured = auto_capture::read(state)?;
             let providers = ProviderService::list(state, AppType::Codex).map_err(service_error)?;
-            let current = ProviderService::current(state, AppType::Codex).map_err(service_error)?;
+            let current = captured.current;
             Ok(json!({"currentProviderId":current,
                 "providers":providers.values().map(summary).collect::<Result<Vec<_>>>()?}))
         }
@@ -222,6 +261,7 @@ fn handle(host: &Host, request: &Request, resident: bool) -> Result<Value> {
                 require_native_state(state)?;
                 require_direct(&provider)?;
             }
+            auto_capture::before_write(state)?;
             lifecycle::conversion(&provider)?;
             let id = provider.id.clone();
             if request.method == "provider/add"
@@ -246,10 +286,13 @@ fn handle(host: &Host, request: &Request, resident: bool) -> Result<Value> {
                 ProviderService::update(state, AppType::Codex, None, provider)
                     .map_err(service_error)
             };
+            if resident && affects_live && changed.is_err() {
+                lifecycle::stop_listener(state)?;
+            }
+            changed?;
             if resident && affects_live {
                 lifecycle::reconcile(state)?;
             }
-            changed?;
             summary(
                 &state
                     .db
@@ -269,27 +312,37 @@ fn handle(host: &Host, request: &Request, resident: bool) -> Result<Value> {
             if !resident {
                 require_native_state(state)?;
                 require_direct(&provider)?;
-            } else {
+            }
+            auto_capture::before_write(state)?;
+            if resident {
                 lifecycle::prepare(state, &provider)?;
             }
             let switched =
                 ProviderService::switch(state, AppType::Codex, id).map_err(service_error);
+            if resident && switched.is_err() {
+                lifecycle::stop_listener(state)?;
+            }
+            let switched = switched?;
             if resident {
                 lifecycle::reconcile(state)?;
             }
-            let switched = switched?;
             // Warnings may contain upstream-controlled text. Expose only their
             // count at this stage; do not leak config or credentials via errors.
             Ok(json!({"providerId":id,"warningCount":switched.warnings.len()}))
         }
         "mcp/import" => {
             let _guard = lifecycle::mutation()?;
+            auto_capture::before_write(state)?;
             require_native_state(state)?;
             Ok(json!({"imported":McpService::import_from_codex(state).map_err(service_error)?}))
         }
         "backend/shutdown" if resident => {
             let _guard = lifecycle::mutation()?;
-            lifecycle::stop(state)?;
+            if lifecycle::owns_live(state).unwrap_or(false) {
+                lifecycle::stop(state)?;
+            } else {
+                lifecycle::stop_listener(state)?;
+            }
             Ok(json!({"status":"shutting_down"}))
         }
         method if method.starts_with("account/") && resident => accounts::handle(state, method, p),
@@ -389,8 +442,11 @@ fn summary(provider: &Provider) -> Result<Value> {
     Ok(result)
 }
 
-fn service_error(_: crate::AppError) -> &'static str {
-    "upstream_operation_failed"
+fn service_error(error: crate::AppError) -> &'static str {
+    match error {
+        crate::AppError::Message(message) if message == "config_conflict" => "config_conflict",
+        _ => "upstream_operation_failed",
+    }
 }
 
 fn lock_store(paths: &RuntimePaths) -> Result<File> {
