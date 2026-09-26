@@ -43,6 +43,16 @@ fn account_summary(host: &Host, account: &Value) -> Value {
         "needsReauthentication":account["reauthRequired"]==true})
 }
 
+pub(super) fn login_pending(host: &Host) -> Result<bool> {
+    Ok(host
+        .gui
+        .lock()
+        .map_err(|_| "session_failed")?
+        .logins
+        .values()
+        .any(|login| login.status == "pending" && login.expires > Utc::now().timestamp_millis()))
+}
+
 pub(super) fn handle(host: &Host, method: &str, params: &Value) -> Result<Value> {
     let state = &host.state;
     match method {

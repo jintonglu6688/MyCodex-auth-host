@@ -45,6 +45,8 @@ pub(super) fn target_identity() -> Result<Value> {
     let mut value = identity()?;
     value["codexHome"] = json!(paths.codex_home);
     value["dataDir"] = json!(paths.data_dir);
+    value["executablePath"] =
+        json!(std::env::current_exe().map_err(|_| "executable_identity_failed")?);
     Ok(value)
 }
 

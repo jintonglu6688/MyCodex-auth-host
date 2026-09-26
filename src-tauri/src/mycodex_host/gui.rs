@@ -244,9 +244,9 @@ pub(super) fn handle(host: &Host, method: &str, params: &Value) -> Result<Value>
             let _guard = lifecycle::mutation()?;
             auto_capture::before_write(state)?;
             let (stored, edited) = selected(host, params, true)?;
-            lifecycle::conversion(&edited)?;
+            let route_required = lifecycle::conversion(&edited)?;
             Ok(
-                json!({"providerId":stored.id,"version":form::version(&stored,&edited),"fingerprint":fingerprint(host)?}),
+                json!({"providerId":stored.id,"version":form::version(&stored,&edited),"fingerprint":fingerprint(host)?,"routeRequired":route_required}),
             )
         }
         "gui/provider/apply" => {

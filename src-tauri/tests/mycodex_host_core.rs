@@ -456,6 +456,8 @@ fn streaming_switch(external: bool) {
         ("provider/switch", json!({"providerId":"official"})),
         ("provider/update", json!({"provider":provider})),
         ("backend/shutdown", json!({})),
+        ("backend/shutdown", json!({"forUpdate":true})),
+        ("backend/shutdown", json!({"forUpdate":false})),
     ] {
         assert_eq!(
             p.call(method, params)["error"]["message"],
@@ -1109,4 +1111,40 @@ fn offline_probe_cannot_bypass_the_resident_target_lock_with_another_store() {
     assert!(p.live_text() == before);
     assert!(!other.data.join("cc-switch.db").exists());
     p.ok("backend/shutdown", json!({}));
+}
+
+#[test]
+fn maintenance_update_preserves_takeover_and_uninstall_requires_direct() {
+    let mut p = Probe::new();
+    let mut daemon = Resident::start(&mut p);
+    p.add(routed("conversion", "openai_chat", "http://127.0.0.1:9/v1"));
+    p.add(api("direct", "test-model", true));
+    p.switch("conversion");
+    let before = p.live_text();
+    let auth = fs::read(p.codex.join("auth.json")).ok();
+    let port = p.ok("status", json!({}))["route"]["port"].clone();
+    assert_eq!(
+        p.call("backend/shutdown", json!({"forUpdate":"true"}))["error"]["message"],
+        "invalid_params"
+    );
+    assert_eq!(
+        p.call("backend/shutdown", json!({"forUpdate":false}))["error"]["message"],
+        "route_required"
+    );
+    assert_eq!(p.ok("status", json!({}))["route"]["running"], true);
+    p.ok("backend/shutdown", json!({"forUpdate":true}));
+    assert!(daemon.0.wait().unwrap().success());
+    assert_eq!(p.live_text(), before);
+    assert_eq!(fs::read(p.codex.join("auth.json")).ok(), auth);
+    let mut replacement = Resident::start(&mut p);
+    let route = p.ok("status", json!({}))["route"].clone();
+    assert_eq!(route["port"], port);
+    assert_eq!(route["accepting"], true);
+    assert_eq!(p.live_text(), before);
+    p.switch("direct");
+    let direct = p.live_text();
+    p.ok("backend/shutdown", json!({"forUpdate":false}));
+    assert!(replacement.0.wait().unwrap().success());
+    assert_eq!(p.live_text(), direct);
+    assert!(p.data.join("cc-switch.db").exists());
 }

@@ -337,8 +337,26 @@ fn handle(host: &Host, request: &Request, resident: bool) -> Result<Value> {
             Ok(json!({"imported":McpService::import_from_codex(state).map_err(service_error)?}))
         }
         "backend/shutdown" if resident => {
+            let for_update = p
+                .get("forUpdate")
+                .map(|v| v.as_bool().ok_or("invalid_params"))
+                .transpose()?;
             let _guard = lifecycle::mutation()?;
-            if lifecycle::owns_live(state).unwrap_or(false) {
+            if gui_accounts::login_pending(host)? {
+                return Err("login_in_progress");
+            }
+            let owns_live = lifecycle::owns_live(state).unwrap_or(false);
+            if for_update == Some(false)
+                && owns_live
+                && lifecycle::status(state)?["takeover"] == true
+            {
+                return Err("route_required");
+            }
+            if for_update == Some(true) {
+                // Keep the native takeover and backup for the replacement process.
+                // Its startup rechecks external ownership before restoring the route.
+                lifecycle::stop_listener(state)?;
+            } else if owns_live {
                 lifecycle::stop(state)?;
             } else {
                 lifecycle::stop_listener(state)?;
