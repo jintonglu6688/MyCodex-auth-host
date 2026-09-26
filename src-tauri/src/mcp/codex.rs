@@ -71,11 +71,17 @@ pub fn import_from_codex(config: &mut MultiAppConfig) -> Result<usize, AppError>
                 continue;
             };
 
-            // type 缺省为 stdio
+            // Codex HTTP entries commonly omit type and supply only url.
             let typ = entry_tbl
                 .get("type")
                 .and_then(|v| v.as_str())
-                .unwrap_or("stdio");
+                .unwrap_or_else(|| {
+                    if entry_tbl.get("url").and_then(|v| v.as_str()).is_some() {
+                        "http"
+                    } else {
+                        "stdio"
+                    }
+                });
 
             // 构建 JSON 规范
             let mut spec = serde_json::Map::new();
@@ -159,54 +165,9 @@ pub fn import_from_codex(config: &mut MultiAppConfig) -> Result<usize, AppError>
                 }
 
                 // 通用 TOML 值到 JSON 值转换
-                let json_val = match toml_val {
-                    toml::Value::String(s) => Some(json!(s)),
-                    toml::Value::Integer(i) => Some(json!(i)),
-                    toml::Value::Float(f) => Some(json!(f)),
-                    toml::Value::Boolean(b) => Some(json!(b)),
-                    toml::Value::Array(arr) => {
-                        // 只支持简单类型数组
-                        let json_arr: Vec<serde_json::Value> = arr
-                            .iter()
-                            .filter_map(|item| match item {
-                                toml::Value::String(s) => Some(json!(s)),
-                                toml::Value::Integer(i) => Some(json!(i)),
-                                toml::Value::Float(f) => Some(json!(f)),
-                                toml::Value::Boolean(b) => Some(json!(b)),
-                                _ => None,
-                            })
-                            .collect();
-                        if !json_arr.is_empty() {
-                            Some(serde_json::Value::Array(json_arr))
-                        } else {
-                            log::debug!("跳过复杂数组字段 '{key}' (TOML → JSON)");
-                            None
-                        }
-                    }
-                    toml::Value::Table(tbl) => {
-                        // 浅层表转为 JSON 对象（仅支持字符串值）
-                        let mut json_obj = serde_json::Map::new();
-                        for (k, v) in tbl.iter() {
-                            if let Some(s) = v.as_str() {
-                                json_obj.insert(k.clone(), json!(s));
-                            }
-                        }
-                        if !json_obj.is_empty() {
-                            Some(serde_json::Value::Object(json_obj))
-                        } else {
-                            log::debug!("跳过复杂对象字段 '{key}' (TOML → JSON)");
-                            None
-                        }
-                    }
-                    toml::Value::Datetime(_) => {
-                        log::debug!("跳过日期时间字段 '{key}' (TOML → JSON)");
-                        None
-                    }
-                };
-
-                if let Some(val) = json_val {
-                    spec.insert(key.clone(), val);
-                    log::debug!("导入扩展字段 '{key}'（值已省略）");
+                // Preserve unknown nested TOML fields without logging their values.
+                if let Ok(value) = serde_json::to_value(toml_val) {
+                    spec.insert(key.clone(), value);
                 }
             }
 
@@ -499,107 +460,39 @@ pub fn remove_server_from_codex(id: &str) -> Result<(), AppError> {
 // TOML 转换辅助函数
 // ============================================================================
 
-/// 通用 JSON 值到 TOML 值转换器（支持简单类型和浅层嵌套）
-///
-/// 支持的类型转换：
-/// - String → TOML String
-/// - Number (i64) → TOML Integer
-/// - Number (f64) → TOML Float
-/// - Boolean → TOML Boolean
-/// - Array[简单类型] → TOML Array
-/// - Object → TOML Inline Table (仅字符串值)
-///
-/// 不支持的类型（返回 None）：
-/// - null
-/// - 深度嵌套对象
-/// - 混合类型数组
-fn json_value_to_toml_item(value: &Value, field_name: &str) -> Option<toml_edit::Item> {
-    use toml_edit::{Array, InlineTable, Item};
-
-    match value {
-        Value::String(s) => Some(toml_edit::value(s.as_str())),
-
-        Value::Number(n) => {
-            if let Some(i) = n.as_i64() {
-                Some(toml_edit::value(i))
-            } else if let Some(f) = n.as_f64() {
-                Some(toml_edit::value(f))
-            } else {
-                log::warn!("跳过字段 '{field_name}': 无法转换的数字类型 {n}");
-                None
-            }
-        }
-
-        Value::Bool(b) => Some(toml_edit::value(*b)),
-
-        Value::Array(arr) => {
-            // 只支持简单类型的数组（字符串、数字、布尔）
-            let mut toml_arr = Array::default();
-            let mut all_same_type = true;
-
-            for item in arr {
-                match item {
-                    Value::String(s) => toml_arr.push(s.as_str()),
-                    Value::Number(n) if n.is_i64() => {
-                        if let Some(i) = n.as_i64() {
-                            toml_arr.push(i);
-                        } else {
-                            all_same_type = false;
-                            break;
-                        }
-                    }
-                    Value::Number(n) if n.is_f64() => {
-                        if let Some(f) = n.as_f64() {
-                            toml_arr.push(f);
-                        } else {
-                            all_same_type = false;
-                            break;
-                        }
-                    }
-                    Value::Bool(b) => toml_arr.push(*b),
-                    _ => {
-                        all_same_type = false;
-                        break;
-                    }
-                }
-            }
-
-            if all_same_type && !toml_arr.is_empty() {
-                Some(Item::Value(toml_edit::Value::Array(toml_arr)))
-            } else {
-                log::warn!("跳过字段 '{field_name}': 不支持的数组类型（混合类型或嵌套结构）");
-                None
-            }
-        }
-
-        Value::Object(obj) => {
-            // 只支持浅层对象（所有值都是字符串）→ TOML Inline Table
-            let mut inline_table = InlineTable::new();
-            let mut all_strings = true;
-
-            for (k, v) in obj {
-                if let Some(s) = v.as_str() {
-                    // InlineTable 需要 Value 类型，toml_edit::value() 返回 Item，需要提取内部的 Value
-                    inline_table.insert(k, s.into());
+/// Preserve TOML-compatible extension fields, including nested and empty values.
+/// Null cannot be represented in TOML and is rejected by callers' validation.
+fn json_value_to_toml_item(value: &Value, _field_name: &str) -> Option<toml_edit::Item> {
+    fn convert(value: &Value) -> Option<toml_edit::Value> {
+        use toml_edit::{Array, InlineTable};
+        Some(match value {
+            Value::String(s) => s.as_str().into(),
+            Value::Bool(v) => (*v).into(),
+            Value::Number(n) => {
+                if let Some(i) = n.as_i64() {
+                    i.into()
                 } else {
-                    all_strings = false;
-                    break;
+                    n.as_f64()?.into()
                 }
             }
-
-            if all_strings && !inline_table.is_empty() {
-                Some(Item::Value(toml_edit::Value::InlineTable(inline_table)))
-            } else {
-                log::warn!("跳过字段 '{field_name}': 对象值包含非字符串类型，建议使用子表语法");
-                None
+            Value::Array(items) => {
+                let mut array = Array::new();
+                for item in items {
+                    array.push(convert(item)?);
+                }
+                array.into()
             }
-        }
-
-        Value::Null => {
-            log::debug!("跳过字段 '{field_name}': TOML 不支持 null 值");
-            None
-        }
+            Value::Object(items) => {
+                let mut table = InlineTable::new();
+                for (key, item) in items {
+                    table.insert(key, convert(item)?);
+                }
+                table.into()
+            }
+            Value::Null => return None,
+        })
     }
+    convert(value).map(toml_edit::Item::Value)
 }
 
 /// Helper: 将 JSON MCP 服务器规范转换为 toml_edit::Table

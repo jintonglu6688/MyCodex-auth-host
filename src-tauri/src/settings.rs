@@ -577,6 +577,9 @@ impl Default for AppSettings {
 
 impl AppSettings {
     fn settings_path() -> Option<PathBuf> {
+        if let Some(paths) = crate::mycodex_host::runtime_paths() {
+            return Some(paths.data_dir.join("settings.json"));
+        }
         // settings.json 保留用于旧版本迁移和无数据库场景
         Some(
             crate::config::get_home_dir()
@@ -921,6 +924,9 @@ pub fn get_claude_override_dir() -> Option<PathBuf> {
 }
 
 pub fn get_codex_override_dir() -> Option<PathBuf> {
+    if let Some(paths) = crate::mycodex_host::runtime_paths() {
+        return Some(paths.codex_home.clone());
+    }
     let settings = settings_store().read().ok()?;
     settings
         .codex_config_dir

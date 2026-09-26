@@ -2024,7 +2024,7 @@ impl CodexOAuthManager {
         Ok(())
     }
 
-    fn load_from_disk_sync(&self) -> Result<(), CodexOAuthError> {
+    pub(crate) fn load_from_disk_sync(&self) -> Result<(), CodexOAuthError> {
         if !self.storage_path.exists() {
             return Ok(());
         }

@@ -357,15 +357,36 @@ fn toml_remove_array_items(target: &mut toml_edit::Array, source: &toml_edit::Ar
     }
 }
 
+fn toml_table_is_subset(target: &dyn TableLike, source: &dyn TableLike) -> bool {
+    source.iter().all(|(key, source_item)| {
+        target
+            .get(key)
+            .is_some_and(|target_item| toml_item_is_subset(target_item, source_item))
+    })
+}
+
 fn toml_item_is_subset(target: &Item, source: &Item) -> bool {
     if let Some(source_table) = source.as_table_like() {
         let Some(target_table) = target.as_table_like() else {
             return false;
         };
-        return source_table.iter().all(|(key, source_item)| {
-            target_table
-                .get(key)
-                .is_some_and(|target_item| toml_item_is_subset(target_item, source_item))
+        return toml_table_is_subset(target_table, source_table);
+    }
+
+    if let Some(source_tables) = source.as_array_of_tables() {
+        let Some(target_tables) = target.as_array_of_tables() else {
+            return false;
+        };
+        let mut matched = vec![false; target_tables.len()];
+        return source_tables.iter().all(|source_table| {
+            if let Some((index, _)) = target_tables.iter().enumerate().find(|(index, target_table)| {
+                !matched[*index] && toml_table_is_subset(*target_table, source_table)
+            }) {
+                matched[index] = true;
+                true
+            } else {
+                false
+            }
         });
     }
 
@@ -400,6 +421,24 @@ fn merge_toml_table_like(target: &mut dyn TableLike, source: &dyn TableLike) {
 }
 
 fn remove_toml_item(target: &mut Item, source: &Item) {
+    // Codex writes skill overrides as [[skills.config]], not inline arrays.
+    // Strip shared entries during backfill so removing an override cannot revive
+    // a stale copy from another provider's private configuration.
+    if let Some(source_tables) = source.as_array_of_tables() {
+        if let Some(target_tables) = target.as_array_of_tables_mut() {
+            for source_table in source_tables.iter() {
+                let index = target_tables.iter().position(|table| toml_table_is_subset(table, source_table));
+                if let Some(index) = index {
+                    target_tables.remove(index);
+                }
+            }
+            if target_tables.is_empty() {
+                *target = Item::None;
+            }
+        }
+        return;
+    }
+
     if let Some(source_table) = source.as_table_like() {
         if let Some(target_table) = target.as_table_like_mut() {
             remove_toml_table_like(target_table, source_table);
@@ -3342,6 +3381,32 @@ base_url = "https://a.example/v1"
             .map(|value| value.as_str().expect("tool id should be string"))
             .collect();
         assert_eq!(values, vec!["tool2"]);
+    }
+
+    #[test]
+    fn codex_common_config_skill_tables_are_stripped_without_losing_private_entries() {
+        let snippet = "[[skills.config]]\npath = 'shared'\nenabled = false\n";
+        let settings = json!({"config": format!(
+            "model = 'test'\n{snippet}[[skills.config]]\npath = 'private'\nenabled = false\n"
+        )});
+        assert!(settings_contain_common_config(&AppType::Codex, &settings, snippet));
+        let stripped = remove_common_config_from_settings(&AppType::Codex, &settings, snippet).unwrap();
+        let config: toml::Value = stripped["config"].as_str().unwrap().parse().unwrap();
+        let skills = config["skills"]["config"].as_array().unwrap();
+        assert_eq!(skills.len(), 1);
+        assert_eq!(skills[0]["path"].as_str(), Some("private"));
+
+        let only_shared = json!({"config": snippet});
+        let stripped = remove_common_config_from_settings(&AppType::Codex, &only_shared, snippet).unwrap();
+        let config: toml::Value = stripped["config"].as_str().unwrap().parse().unwrap();
+        assert!(config.get("skills").is_none());
+
+        let duplicate = format!("{snippet}{snippet}");
+        assert!(!settings_contain_common_config(&AppType::Codex, &only_shared, &duplicate));
+        let changed = json!({"config": snippet.replace("false", "true")});
+        assert!(!settings_contain_common_config(&AppType::Codex, &changed, snippet));
+        let kept = remove_common_config_from_settings(&AppType::Codex, &changed, snippet).unwrap();
+        assert!(kept["config"].as_str().unwrap().contains("enabled = true"));
     }
 
     #[test]

@@ -23,6 +23,7 @@ mod linux_fix;
 mod mcode_config;
 mod mcp;
 mod model_capabilities;
+pub mod mycodex_host;
 mod openclaw_config;
 mod opencode_config;
 mod panic_hook;

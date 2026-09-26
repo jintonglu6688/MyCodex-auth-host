@@ -2506,7 +2506,7 @@ impl ProxyService {
             .is_some_and(predicate)
     }
 
-    async fn live_takeover_matches_current_proxy(
+    pub(crate) async fn live_takeover_matches_current_proxy(
         &self,
         app_type: &AppType,
     ) -> Result<bool, String> {
@@ -2611,6 +2611,12 @@ impl ProxyService {
                 .map_err(|e| format!("清理 Codex 接管占位符失败: {e}"))?;
             let updated = crate::codex_config::remove_codex_official_proxy_route(&updated)
                 .map_err(|e| format!("清理 Codex 官方接管路由失败: {e}"))?;
+            let updated = if crate::mycodex_host::runtime_paths().is_some() {
+                crate::mycodex_host::lifecycle::remove_route_auth(&updated)
+                    .map_err(str::to_string)?
+            } else {
+                updated
+            };
             config["config"] = json!(updated);
         }
 
@@ -3758,6 +3764,12 @@ impl ProxyService {
                     }
                     None => injected,
                 }
+            };
+            let live_config = if crate::mycodex_host::runtime_paths().is_some() {
+                crate::mycodex_host::lifecycle::project_route_auth(&live_config)
+                    .map_err(str::to_string)?
+            } else {
+                live_config
             };
             crate::codex_config::write_codex_live_config_atomic(Some(&live_config))
                 .map_err(|e| format!("写入 Codex 配置失败: {e}"))?;

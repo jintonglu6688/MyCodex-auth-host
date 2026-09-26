@@ -6213,7 +6213,7 @@ impl ProviderService {
     /// 仅对**显式勾选"写入通用配置"**（`meta.common_config_enabled == Some(true)`）的
     /// 供应商生效；用户**显式清空**过片段（`_cleared`）时跳过，避免把用户主动清掉的
     /// 配置又塞回来。所有失败均为非致命，只记 warning，绝不阻断切换。
-    fn sync_common_config_snippet_from_live(
+    pub(crate) fn sync_common_config_snippet_from_live(
         state: &AppState,
         app_type: &AppType,
         provider: &Provider,

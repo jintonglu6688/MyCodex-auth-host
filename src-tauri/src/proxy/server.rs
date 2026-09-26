@@ -107,6 +107,11 @@ impl ProxyServer {
 
         // 构建路由
         let app = self.build_router();
+        let app = if crate::mycodex_host::runtime_paths().is_some() {
+            app.layer(axum::middleware::from_fn(crate::mycodex_host::lifecycle::admit))
+        } else {
+            app
+        };
 
         // 绑定监听器
         let listener = tokio::net::TcpListener::bind(&addr)
