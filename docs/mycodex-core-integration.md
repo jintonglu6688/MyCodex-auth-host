@@ -159,13 +159,66 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts/Package-MyCodexAuthC
 
 本轮补充路由认证、同目标单次入口锁及清理回归后，核心进程测试 **18/18 通过**。当前独立 GUI 包为 `artifacts/auth-core-gui-v2`，协议 2，包含 manifest 与 LICENSE；打包及 `VerifyOnly` 均通过。该目录不覆盖旧 runtime，GUI 部署由 MyCodex 仓库入口负责。
 
+## Unix 新内核接线（2026-09-26）
+
+WSL/Linux/macOS 共用协议 2 的 `serve/rpc` 和原版服务，不复用旧协议 1 的存档。
+独立程序为 `$HOME/.local/share/MyCodex/auth-core/bin/mycodex-auth-host`；私有数据为
+`$HOME/.local/share/MyCodex/auth-core/targets/<canonical CodexHome 的 SHA256>`。
+旧 `auth-center` 部署不会被安装脚本修改，安装也不启动后台或更改 `.codex`。
+
+`--paths-json [--codex-home /absolute/existing] [--data-dir /absolute/path]` 只读返回
+`codexHome/dataDir/executablePath`，不创建目录或数据库。CodexHome 缺省读取远端环境
+`CODEX_HOME`，否则取远端 `$HOME/.codex`；目录必须已存在。不存在、不是目录或相对路径
+返回 `invalid_codex_home`，客户端应提示先初始化该目标 Codex 目录，不能退回 Windows。
+符号链接解析到同一 canonical CodexHome 时使用同一私有目录；不同目标使用不同 hash。
+实际启动仍要求显式传入已创建的 `--codex-home` 和 `--data-dir`。
+Unix 启动设置 umask 077，私有目录和 IPC 目录权限 0700、socket 0600。
+
+Linux 仍动态依赖原版 GTK3、WebKitGTK 4.1、OpenSSL 等库。无 GUI 入口不代表无需桌面库；
+部署前必须核查目标动态依赖。此次 Ubuntu 已有 Rust 1.95、C 工具链、pkg-config 和这些库，
+无需安装。macOS 需要本机对应架构工具链；后续已完成下述 Mac 部署，真实 Linux SSH 新产物仍未单独部署验收。
+
+```sh
+export CARGO_TARGET_DIR="$HOME/.cache/mycodex-auth-core-target"
+cargo build --locked --manifest-path src-tauri/Cargo.toml --bin mycodex-auth-host
+python3 scripts/Package-MyCodexAuthCore.py package --binary "$CARGO_TARGET_DIR/debug/mycodex-auth-host" --output /absolute/new-package
+python3 scripts/Package-MyCodexAuthCore.py verify --package /absolute/new-package
+python3 scripts/Package-MyCodexAuthCore.py install --package /absolute/new-package
+python3 scripts/Test-MyCodexAuthCoreUnix.py "$CARGO_TARGET_DIR/debug/mycodex-auth-host"
+```
+
+Python 脚本仅使用标准库，校验协议/平台/上游版本、产物自报身份、manifest 和 SHA256，
+保留上游 LICENSE。安装拒绝链接路径、非当前用户所有或其他用户可写的安装祖先；
+更新只替换该独立 bin 目录的三个文件，不清理数据、不停止正在运行的后台。
+可执行文件原子替换；若更新中断导致 manifest 不匹配，客户端拒绝启动而非忽略校验。
+这些哈希用于检测错包和损坏，不是发行签名。
+
+Windows 创建的 Git worktree 若在 WSL 构建，`.git` 里的盘符路径无法由 Linux Git 解析，
+需为该次构建指定正确的 Linux `GIT_DIR`/`GIT_WORK_TREE` 和 `GIT_OPTIONAL_LOCKS=0`，
+使构建从真实 Git 元数据读取身份；不能伪造 revision 环境变量。普通 Unix clone 不需要。
+
+WSL 隔离检查已通过：只读路径发现、符号链接同目标归一、不同目标隔离、ready/status
+身份匹配、私有权限、重复实例拒绝、错误 store 拒绝、不安全 socket 拒绝、正常关闭，
+以及临时 HOME 打包/安装/重复更新/篡改拒绝、其他用户可写安装祖先拒绝。
+原 GUI 进程回归 5/5、核心生命周期进程回归 18/18 在 WSL 通过，覆盖原生服务、
+MCP、公用工具偏好、直连/Chat/Anthropic 转换、恢复和在途请求互斥。
+所有配置均为临时目录；未修改真实全局认证。
+当前 WSL 包位于 `artifacts/auth-core-unix-v2-reviewed`，使用真实 sourceRevision 和 dirty 标记，
+已安装新独立 bin；尚需 MyCodex GUI 和真实会话人工验收。此段更新前文仅 Windows 的历史验证范围。
+
+后续用户已确认 WSL 成功，选择 Mac 代表 SSH 验收。Mac arm64 / macOS 26.7 使用既有 Rust 1.95、独立 Command Line Tools 构建成功；只在构建进程设置 `DEVELOPER_DIR`，未更改全局工具链。`Test-MyCodexAuthCoreUnix.py` 隔离检查及打包/安装通过，依赖均为 macOS 系统库。Mac 包副本 `artifacts/auth-core-macos-arm64-reviewed`，SHA256 `063b2da8b14f22466cf6a1971c7be523792d2cb5b644ebd7ac66cd2a13302f85`，sourceRevision 为 `eacc926b8cad512724b1027b35c294697adced32` 加当前 Unix 修改，dirty=true。
+
+MyCodex 侧已验证真实 C#→SSH→Mac 临时 HOME 的供应商保存、转换路由启停、MCP保留/删除及重复连接；正式目标下只读启停也通过。按用户授权清理了旧 Mac 部署，全局原有 ChatGPT 登录及配置保留；随后用户确认 Mac 人工测试通过。新全局自动收录尚未开发。
+
+2026-09-26 用户确认本轮多平台验收完成，并授权提交推送前后台全部修改、结束 MyCodex #99/#115，仅保留 #116 一键部署与产物分发。自动收录作为后续独立工作；未测的跨客户端、OS 重启和正式发行范围不因工单关闭而被标为通过。既有开发产物保留原 dirty 身份，源码提交不改已部署包。
+
 ## 尚未验证及接续边界
 
 - `request` 保持原单次限制；`serve/rpc` 已持有原版账号状态和路由，GUI 协议已接入；没有为测试加入令牌注入接口。实际 WinForms 界面的测试和部署证据记录在 MyCodex 仓库。
 - 文件型合成账号的进程测试与原版托管账号单元测试是两层证据，均不等于真实 OAuth 登录、客户端对话或端到端直连验收。
 - 新后台账号开始/轮询/取消方法已连到原服务，自动测试覆盖账号归档读取/默认账号/删除及无效登录任务；没有真实浏览器授权验证。托管账号真实刷新与目标会话仍需人工验收。
 - Windows MCP 管理已通过原版 MCP 数据库服务；Plugins/Skills 保持 App Server 的安装、文件与启停入口，其配置依照原版公用片段开关共享，不另造插件/Skills 存档。实际 App Server 联调和用户验收记录见 MyCodex 仓库。
-- 本后台任务未修改真实账号数据，未部署 WSL/Linux/Mac SSH 或验证安装更新。Unix IPC 源码复用已接入，但本轮未编译或部署 Unix 产物；后续统一工具入口并重新验收各平台。
+- 新后台已在 WSL、Mac SSH 编译部署，用户已确认两者人工测试通过；Mac 实际 SSH 隔离联调也通过。Linux SSH 新产物本轮按用户决定不单独重测，正式安装恢复仍待完成。旧部署清理均保留全局认证和工具配置，具体记录见客户端交接文档。
 - 本阶段不提供额外跨进程回滚保证；原版操作结果和并发冲突行为仍需在常驻/远程集成阶段逐项验证。
 
 后续沿用这里证明的原服务调用链，完成 WinForms 手测、统一工具入口与冲突恢复交互，使用干净数据做真实账号与多平台验收，最后删除旧重复业务流程。

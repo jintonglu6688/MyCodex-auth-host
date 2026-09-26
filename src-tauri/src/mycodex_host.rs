@@ -17,6 +17,7 @@ mod gui_mcp;
 mod gui_provider;
 mod identity;
 mod ipc;
+mod paths;
 pub(crate) mod lifecycle;
 mod security;
 
@@ -59,6 +60,9 @@ pub fn run(mut args: impl Iterator<Item = OsString>) -> Result<()> {
         }
         return output(&identity::identity()?);
     }
+    if command == "--paths-json" {
+        return output(&paths::resolve(args)?);
+    }
     if !matches!(command, "request" | "serve" | "rpc") {
         return Err("invalid_arguments");
     }
@@ -89,6 +93,11 @@ pub fn run(mut args: impl Iterator<Item = OsString>) -> Result<()> {
         return Err("overlapping_directories");
     }
     if command != "rpc" {
+        // Native services create credential-bearing files under the private store.
+        #[cfg(unix)]
+        unsafe {
+            libc::umask(0o077);
+        }
         security::prepare_directory(&paths.data_dir)?;
     }
     PATHS
