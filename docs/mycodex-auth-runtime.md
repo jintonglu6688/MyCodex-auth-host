@@ -31,13 +31,25 @@ remain separate steps.
 
 ## Build and publication
 
-`.github/workflows/auth-core-release.yml` builds four native targets. Branch,
-pull-request and manual runs upload Actions artifacts without publishing a
-release. Push `auth-core-v<hostVersion>` to publish a release after **all**
-platforms have built and passed the isolated core/GUI protocol process tests.
-The version must match the executable's embedded `hostVersion` (currently
-`0.2.0`). Tags use their own prefix and do not trigger the upstream desktop
-`v*` release workflow.
+`.github/workflows/auth-core-release.yml` builds four native targets only when
+started manually. Select `feature/authentication-core-upstream` as the ref to
+build test artifacts without publishing. To publish, first push an
+`auth-core-v<hostVersion>` tag on a commit containing this workflow, then run
+the workflow manually with that tag as the ref. The release is published after
+**all** platforms have built and passed the isolated core/GUI protocol process
+tests. The version must match the executable's embedded `hostVersion`
+(currently `0.2.0`). Neither branch changes nor tag pushes start this workflow.
+The authentication tag prefix does not trigger the upstream desktop `v*`
+release workflow.
+
+```text
+gh workflow run auth-core-release.yml --repo jintonglu6688/MyCodex-auth-host --ref feature/authentication-core-upstream
+gh workflow run auth-core-release.yml --repo jintonglu6688/MyCodex-auth-host --ref auth-core-v<hostVersion>
+```
+
+GitHub requires a workflow with `workflow_dispatch` on the default branch to
+offer manual runs. The default branch contains a small entry point; select the
+authentication-core branch or a matching tag to run the full build workflow.
 
 The workflow reuses `Package-MyCodexAuthCore.ps1` on Windows and
 `Package-MyCodexAuthCore.py` on Unix. `Release-MyCodexAuthCore.py` rejects dirty
