@@ -48,6 +48,8 @@ pub struct VisibleApps {
     pub hermes: bool,
     #[serde(default = "default_true")]
     pub pi: bool,
+    #[serde(default = "default_true")]
+    pub mcode: bool,
 }
 
 impl Default for VisibleApps {
@@ -62,6 +64,7 @@ impl Default for VisibleApps {
             openclaw: true,
             hermes: false, // 默认不显示，需用户手动启用
             pi: true,
+            mcode: true,
         }
     }
 }
@@ -79,6 +82,7 @@ impl VisibleApps {
             AppType::OpenClaw => self.openclaw,
             AppType::Hermes => self.hermes,
             AppType::Pi => self.pi,
+            AppType::Mcode => self.mcode,
         }
     }
 }
@@ -573,6 +577,9 @@ impl Default for AppSettings {
 
 impl AppSettings {
     fn settings_path() -> Option<PathBuf> {
+        if let Some(paths) = crate::mycodex_host::runtime_paths() {
+            return Some(paths.data_dir.join("settings.json"));
+        }
         // settings.json 保留用于旧版本迁移和无数据库场景
         Some(
             crate::config::get_home_dir()
@@ -917,6 +924,9 @@ pub fn get_claude_override_dir() -> Option<PathBuf> {
 }
 
 pub fn get_codex_override_dir() -> Option<PathBuf> {
+    if let Some(paths) = crate::mycodex_host::runtime_paths() {
+        return Some(paths.codex_home.clone());
+    }
     let settings = settings_store().read().ok()?;
     settings
         .codex_config_dir
@@ -1009,7 +1019,7 @@ pub fn get_current_provider(app_type: &AppType) -> Option<String> {
         AppType::OpenCode => settings.current_provider_opencode.clone(),
         AppType::OpenClaw => settings.current_provider_openclaw.clone(),
         AppType::Hermes => settings.current_provider_hermes.clone(),
-        AppType::Pi => None,
+        AppType::Pi | AppType::Mcode => None,
     }
 }
 
@@ -1028,7 +1038,7 @@ pub fn set_current_provider(app_type: &AppType, id: Option<&str>) -> Result<(), 
         AppType::OpenCode => settings.current_provider_opencode = id_owned.clone(),
         AppType::OpenClaw => settings.current_provider_openclaw = id_owned.clone(),
         AppType::Hermes => settings.current_provider_hermes = id_owned.clone(),
-        AppType::Pi => {}
+        AppType::Pi | AppType::Mcode => {}
     })
 }
 

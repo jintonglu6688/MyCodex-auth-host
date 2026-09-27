@@ -14,7 +14,7 @@ use crate::config::{delete_file, get_claude_settings_path, read_json_file, write
 use crate::database::Database;
 use crate::error::AppError;
 use crate::provider::Provider;
-use crate::proxy::providers::codex_oauth_auth::CodexOAuthManager;
+use crate::proxy::providers::codex_oauth_auth::{CodexLiveAuthSwitchGuard, CodexOAuthManager};
 use crate::services::mcp::McpService;
 use crate::store::AppState;
 
@@ -189,6 +189,8 @@ pub(crate) fn provider_exists_in_live_config(
         AppType::Hermes => crate::hermes_config::get_providers()
             .map(|providers| providers.contains_key(provider_id)),
         AppType::Pi => crate::pi_config::pi_provider_exists(provider_id),
+        AppType::Mcode => crate::mcode_config::get_providers()
+            .map(|providers| providers.contains_key(provider_id)),
         _ => Ok(false),
     }
 }
@@ -355,15 +357,36 @@ fn toml_remove_array_items(target: &mut toml_edit::Array, source: &toml_edit::Ar
     }
 }
 
+fn toml_table_is_subset(target: &dyn TableLike, source: &dyn TableLike) -> bool {
+    source.iter().all(|(key, source_item)| {
+        target
+            .get(key)
+            .is_some_and(|target_item| toml_item_is_subset(target_item, source_item))
+    })
+}
+
 fn toml_item_is_subset(target: &Item, source: &Item) -> bool {
     if let Some(source_table) = source.as_table_like() {
         let Some(target_table) = target.as_table_like() else {
             return false;
         };
-        return source_table.iter().all(|(key, source_item)| {
-            target_table
-                .get(key)
-                .is_some_and(|target_item| toml_item_is_subset(target_item, source_item))
+        return toml_table_is_subset(target_table, source_table);
+    }
+
+    if let Some(source_tables) = source.as_array_of_tables() {
+        let Some(target_tables) = target.as_array_of_tables() else {
+            return false;
+        };
+        let mut matched = vec![false; target_tables.len()];
+        return source_tables.iter().all(|source_table| {
+            if let Some((index, _)) = target_tables.iter().enumerate().find(|(index, target_table)| {
+                !matched[*index] && toml_table_is_subset(*target_table, source_table)
+            }) {
+                matched[index] = true;
+                true
+            } else {
+                false
+            }
         });
     }
 
@@ -398,6 +421,24 @@ fn merge_toml_table_like(target: &mut dyn TableLike, source: &dyn TableLike) {
 }
 
 fn remove_toml_item(target: &mut Item, source: &Item) {
+    // Codex writes skill overrides as [[skills.config]], not inline arrays.
+    // Strip shared entries during backfill so removing an override cannot revive
+    // a stale copy from another provider's private configuration.
+    if let Some(source_tables) = source.as_array_of_tables() {
+        if let Some(target_tables) = target.as_array_of_tables_mut() {
+            for source_table in source_tables.iter() {
+                let index = target_tables.iter().position(|table| toml_table_is_subset(table, source_table));
+                if let Some(index) = index {
+                    target_tables.remove(index);
+                }
+            }
+            if target_tables.is_empty() {
+                *target = Item::None;
+            }
+        }
+        return;
+    }
+
     if let Some(source_table) = source.as_table_like() {
         if let Some(target_table) = target.as_table_like_mut() {
             remove_toml_table_like(target_table, source_table);
@@ -531,6 +572,7 @@ fn settings_contain_common_config(app_type: &AppType, settings: &Value, snippet:
         | AppType::OpenClaw
         | AppType::Hermes
         | AppType::Pi
+        | AppType::Mcode
         | AppType::ClaudeDesktop => false,
     }
 }
@@ -606,6 +648,7 @@ pub(crate) fn remove_common_config_from_settings(
         | AppType::OpenClaw
         | AppType::Hermes
         | AppType::Pi
+        | AppType::Mcode
         | AppType::ClaudeDesktop => Ok(settings.clone()),
     }
 }
@@ -666,6 +709,7 @@ fn apply_common_config_to_settings(
         | AppType::OpenClaw
         | AppType::Hermes
         | AppType::Pi
+        | AppType::Mcode
         | AppType::ClaudeDesktop => Ok(settings.clone()),
     }
 }
@@ -869,6 +913,10 @@ fn get_codex_managed_oauth_live_auth_value(
 ) -> Result<Value, AppError> {
     std::thread::spawn(move || {
         tauri::async_runtime::block_on(async move {
+            manager
+                .ensure_account_exists(&account_id)
+                .await
+                .map_err(|error| error.to_string())?;
             let bundle = manager
                 .get_valid_token_bundle_for_account(&account_id)
                 .await
@@ -907,7 +955,7 @@ fn get_codex_managed_oauth_live_auth_value(
 pub(crate) fn prepare_codex_managed_oauth_live_auth_switch_away(
     manager: Arc<CodexOAuthManager>,
     account_id: String,
-) -> Result<Option<String>, AppError> {
+) -> Result<CodexLiveAuthSwitchGuard, AppError> {
     std::thread::spawn(move || {
         tauri::async_runtime::block_on(async move {
             manager
@@ -1110,6 +1158,32 @@ fn restore_live_settings_for_provider_backfill(
                 "Failed to strip unified session bucket while backfilling '{}': {err}",
                 provider.id
             );
+        }
+    }
+
+    // Live `auth.json` is a single shared slot with no provider identity, and
+    // on Codex 0.149+ a third-party route never reads it: the switch deletes
+    // the file in default mode, and `set_codex_experimental_bearer_token`
+    // skips injection entirely when the provider table declares its own
+    // credential source (`env_key`, `auth`/`aws`, an explicit Authorization
+    // header). A credential-less Live auth is therefore an absent field, not
+    // the user clearing the key — the DB row is the only copy left, and a
+    // switch-away backfill must not erase it. Live still wins whenever it
+    // carries material (the manual `~/.codex/auth.json` edit path), and
+    // official providers keep the Live login as their authoritative source.
+    if provider.category.as_deref() != Some("official")
+        && !crate::proxy::providers::is_codex_official_provider(provider)
+    {
+        let stored_auth = provider.settings_config.get("auth");
+        let live_auth_has_material = settings
+            .get("auth")
+            .is_some_and(crate::codex_config::codex_auth_has_login_material);
+        if !live_auth_has_material
+            && stored_auth.is_some_and(crate::codex_config::codex_auth_has_login_material)
+        {
+            if let (Some(obj), Some(stored_auth)) = (settings.as_object_mut(), stored_auth) {
+                obj.insert("auth".to_string(), stored_auth.clone());
+            }
         }
     }
 
@@ -1430,6 +1504,9 @@ pub(crate) fn write_live_snapshot(app_type: &AppType, provider: &Provider) -> Re
             crate::hermes_config::set_provider(&provider.id, provider.settings_config.clone())?;
             log::debug!("Hermes provider '{}' written to live config", provider.id);
         }
+        AppType::Mcode => {
+            crate::mcode_config::set_provider(&provider.id, provider.settings_config.clone())?
+        }
         AppType::Pi => {
             return Err(AppError::InvalidInput(
                 "Pi providers use the Pi provider service".to_string(),
@@ -1660,7 +1737,7 @@ pub fn sync_current_to_live(state: &AppState) -> Result<(), AppError> {
 
     // Sync providers based on mode
     for app_type in AppType::all() {
-        if matches!(app_type, AppType::Pi) {
+        if matches!(app_type, AppType::Pi | AppType::Mcode) {
             continue;
         }
         let result = if app_type.is_additive_mode() {
@@ -1815,6 +1892,7 @@ pub fn read_live_settings(app_type: AppType) -> Result<Value, AppError> {
             let config = crate::hermes_config::yaml_to_json(&yaml_config)?;
             Ok(config)
         }
+        AppType::Mcode => Ok(json!(crate::mcode_config::get_providers()?)),
         AppType::Pi => Err(AppError::InvalidInput(
             "Pi providers are read from Pi's native models file".to_string(),
         )),
@@ -1927,7 +2005,7 @@ pub fn import_default_config(state: &AppState, app_type: AppType) -> Result<bool
             })
         }
         // OpenCode, OpenClaw and Hermes use additive mode and are handled by early return above
-        AppType::OpenCode | AppType::OpenClaw | AppType::Hermes | AppType::Pi => {
+        AppType::OpenCode | AppType::OpenClaw | AppType::Hermes | AppType::Pi | AppType::Mcode => {
             unreachable!("additive mode apps are handled by early return")
         }
     };
@@ -3089,6 +3167,65 @@ base_url = "https://a.example/v1"
     }
 
     #[test]
+    fn category_less_fixed_follow_login_backfill_preserves_logout() {
+        let provider = Provider::with_id(
+            crate::database::CODEX_OFFICIAL_PROVIDER_ID.to_string(),
+            "OpenAI Official".to_string(),
+            json!({
+                "auth": {
+                    "auth_mode": "chatgpt",
+                    "tokens": { "refresh_token": "old-refresh-token" }
+                },
+                "config": "model = \"old-model\"\n"
+            }),
+            None,
+        );
+        assert!(crate::proxy::providers::is_codex_official_provider(
+            &provider
+        ));
+
+        for live_auth in [json!({}), json!({ "auth_mode": "chatgpt" })] {
+            let live_settings = json!({
+                "auth": live_auth,
+                "config": "model = \"live-model\"\n"
+            });
+            let backfilled = restore_live_settings_for_provider_backfill(
+                &AppType::Codex,
+                &provider,
+                live_settings.clone(),
+            );
+
+            assert_eq!(
+                backfilled, live_settings,
+                "a legacy official card must not restore the stored login after logout"
+            );
+        }
+    }
+
+    #[test]
+    fn category_less_fixed_third_party_backfill_keeps_stored_api_key() {
+        let provider = Provider::with_id(
+            crate::database::CODEX_OFFICIAL_PROVIDER_ID.to_string(),
+            "Custom API".to_string(),
+            json!({
+                "auth": { "OPENAI_API_KEY": "sk-db-only" },
+                "config": "model_provider = \"custom\"\n"
+            }),
+            None,
+        );
+        assert!(!crate::proxy::providers::is_codex_official_provider(
+            &provider
+        ));
+        let backfilled = restore_live_settings_for_provider_backfill(
+            &AppType::Codex,
+            &provider,
+            json!({ "auth": {}, "config": "model_provider = \"custom\"\n" }),
+        );
+
+        assert_eq!(backfilled, provider.settings_config);
+    }
+
+    #[test]
     fn backfill_never_persists_native_tokens_into_managed_provider_config() {
         // 托管 provider 的存储配置以占位 auth 表示；但 live 里此刻是用户自己
         // 浏览器登录的原生 auth（含真实 refresh_token）。backfill 必须把 live
@@ -3247,6 +3384,32 @@ base_url = "https://a.example/v1"
     }
 
     #[test]
+    fn codex_common_config_skill_tables_are_stripped_without_losing_private_entries() {
+        let snippet = "[[skills.config]]\npath = 'shared'\nenabled = false\n";
+        let settings = json!({"config": format!(
+            "model = 'test'\n{snippet}[[skills.config]]\npath = 'private'\nenabled = false\n"
+        )});
+        assert!(settings_contain_common_config(&AppType::Codex, &settings, snippet));
+        let stripped = remove_common_config_from_settings(&AppType::Codex, &settings, snippet).unwrap();
+        let config: toml::Value = stripped["config"].as_str().unwrap().parse().unwrap();
+        let skills = config["skills"]["config"].as_array().unwrap();
+        assert_eq!(skills.len(), 1);
+        assert_eq!(skills[0]["path"].as_str(), Some("private"));
+
+        let only_shared = json!({"config": snippet});
+        let stripped = remove_common_config_from_settings(&AppType::Codex, &only_shared, snippet).unwrap();
+        let config: toml::Value = stripped["config"].as_str().unwrap().parse().unwrap();
+        assert!(config.get("skills").is_none());
+
+        let duplicate = format!("{snippet}{snippet}");
+        assert!(!settings_contain_common_config(&AppType::Codex, &only_shared, &duplicate));
+        let changed = json!({"config": snippet.replace("false", "true")});
+        assert!(!settings_contain_common_config(&AppType::Codex, &changed, snippet));
+        let kept = remove_common_config_from_settings(&AppType::Codex, &changed, snippet).unwrap();
+        assert!(kept["config"].as_str().unwrap().contains("enabled = true"));
+    }
+
+    #[test]
     fn codex_switch_backfill_preserves_stored_model_catalog_when_live_lacks_it() {
         // Reproduces the data-loss bug: switching away from a Codex provider
         // backfills the outgoing provider from Live, but Live's config.toml had
@@ -3317,6 +3480,75 @@ base_url = "https://a.example/v1"
             result.get("modelCatalog"),
             live_settings.get("modelCatalog"),
             "backfill must keep the Live-reconstructed catalog when the DB has none"
+        );
+    }
+
+    #[test]
+    fn codex_switch_backfill_keeps_stored_auth_when_live_has_no_credential() {
+        // Repro of #7433: the provider table declares its own Authorization
+        // header, so the switch injects no bearer token into config.toml, and
+        // default mode deletes the shared auth.json. Live is `{ auth: {}, … }`
+        // while the stored key is the only remaining copy — the switch-away
+        // backfill must keep it, while still capturing the Live config.toml.
+        let mut provider = Provider::with_id(
+            "header-auth".to_string(),
+            "Header Auth".to_string(),
+            json!({
+                "auth": { "OPENAI_API_KEY": "sk-db-only" },
+                "config": "model_provider = \"custom\"\nmodel = \"old-model\"\n"
+            }),
+            None,
+        );
+        provider.category = Some("custom".to_string());
+
+        let live_settings = json!({
+            "auth": {},
+            "config": "model_provider = \"custom\"\nmodel = \"live-model\"\n"
+        });
+
+        let result =
+            restore_live_settings_for_provider_backfill(&AppType::Codex, &provider, live_settings);
+
+        assert_eq!(
+            result.get("auth"),
+            Some(&json!({ "OPENAI_API_KEY": "sk-db-only" })),
+            "a credential-less Live auth.json must not erase the stored provider key"
+        );
+        assert_eq!(
+            result.get("config"),
+            Some(&json!(
+                "model_provider = \"custom\"\nmodel = \"live-model\"\n"
+            )),
+            "Live still owns the config.toml snapshot"
+        );
+    }
+
+    #[test]
+    fn codex_switch_backfill_keeps_live_auth_when_it_carries_material() {
+        // Positive control: a Live auth.json that does carry material stays
+        // authoritative (the manual `~/.codex/auth.json` edit path).
+        let mut provider = Provider::with_id(
+            "custom".to_string(),
+            "Custom".to_string(),
+            json!({
+                "auth": { "OPENAI_API_KEY": "sk-db-stale" },
+                "config": "model_provider = \"custom\"\n"
+            }),
+            None,
+        );
+        provider.category = Some("custom".to_string());
+
+        let live_settings = json!({
+            "auth": { "OPENAI_API_KEY": "sk-live" },
+            "config": "model_provider = \"custom\"\n"
+        });
+
+        let result =
+            restore_live_settings_for_provider_backfill(&AppType::Codex, &provider, live_settings);
+
+        assert_eq!(
+            result.get("auth"),
+            Some(&json!({ "OPENAI_API_KEY": "sk-live" }))
         );
     }
 

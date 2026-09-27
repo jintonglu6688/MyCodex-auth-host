@@ -1,5 +1,6 @@
 node_modules/
 dist/
+/artifacts/
 release/
 .DS_Store
 *.log
@@ -9,6 +10,8 @@ release/
 .npmrc
 CLAUDE.md
 AGENTS.md
+# Version the MyCodex maintainer entry point at the repository root.
+!/AGENTS.md
 GEMINI.md
 /.claude
 /.codex

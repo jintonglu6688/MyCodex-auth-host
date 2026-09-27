@@ -1,11 +1,9 @@
-name: WSL2 Nightly
+name: WSL2 Full Suite
 
 # The full backend suite takes 50+ minutes on a \\wsl.localhost 9P filesystem,
-# so it runs nightly instead of per PR. The per-PR gate in ci.yml only runs the
-# atomic-write contract test against the same WSL2-backed environment.
+# so this fork runs it only on demand. The manual ci.yml workflow runs just
+# the atomic-write contract test against the same WSL2-backed environment.
 on:
-  schedule:
-    - cron: "23 18 * * *" # 02:23 Beijing time
   workflow_dispatch:
 
 jobs:

@@ -226,6 +226,12 @@ fn build_client(proxy_url: Option<&str>) -> Result<Client, String> {
         .no_deflate()
         .no_zstd();
 
+    if crate::mycodex_host::runtime_paths().is_some() {
+        // The headless GUI can supply x-api-key and other private headers;
+        // reqwest only strips standard Authorization on cross-origin redirects.
+        builder = builder.redirect(headless_redirect_policy());
+    }
+
     // 有代理地址则使用代理，否则跟随系统代理
     if let Some(url) = proxy_url {
         // 先验证 URL 格式和 scheme
@@ -261,6 +267,22 @@ fn build_client(proxy_url: Option<&str>) -> Result<Client, String> {
     builder
         .build()
         .map_err(|e| format!("Failed to build HTTP client: {e}"))
+}
+
+fn headless_redirect_policy() -> reqwest::redirect::Policy {
+    reqwest::redirect::Policy::custom(|attempt| {
+        if attempt.previous().len() >= 10 {
+            attempt.error("redirect_limit")
+        } else if attempt.previous().first().is_some_and(|first| {
+            first.origin() != attempt.url().origin()
+                || !attempt.url().username().is_empty()
+                || attempt.url().password().is_some()
+        }) {
+            attempt.stop()
+        } else {
+            attempt.follow()
+        }
+    })
 }
 
 fn system_proxy_points_to_loopback() -> bool {
@@ -325,9 +347,14 @@ pub fn mask_url(url: &str) -> String {
             None => format!("{}://{}", parsed.scheme(), host),
         }
     } else {
-        // URL 解析失败，返回部分内容
+        // URL 解析失败，返回部分内容。截断点回退到最近的字符边界，
+        // 避免在多字节 UTF-8 字符中间切割导致 panic。
         if url.len() > 20 {
-            format!("{}...", &url[..20])
+            let cut = (0..=20)
+                .rev()
+                .find(|&i| url.is_char_boundary(i))
+                .unwrap_or(0);
+            format!("{}...", &url[..cut])
         } else {
             url.to_string()
         }
@@ -367,9 +394,89 @@ mod tests {
     }
 
     #[test]
+    fn test_mask_url_does_not_panic_on_multibyte_boundary() {
+        // 一个无法被 Url::parse 解析、且在字节 20 处正好切在多字节字符中间的字符串。
+        // 回归 https://github.com/farion1231/cc-switch 的 mask_url 越界 panic。
+        let bad = "这是一个无效的代理地址不能解析";
+        assert!(bad.len() > 20 && !bad.is_char_boundary(20));
+        let masked = mask_url(bad);
+        assert!(masked.ends_with("..."));
+    }
+
+    #[test]
     fn test_build_client_direct() {
         let result = build_client(None);
         assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn headless_redirect_does_not_forward_private_headers_to_another_origin() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let other = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let source = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target = format!("http://{}/models", other.local_addr().unwrap());
+        let address = source.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = source.accept().await.unwrap();
+            let mut bytes = [0; 4096];
+            let count = stream.read(&mut bytes).await.unwrap();
+            assert!(String::from_utf8_lossy(&bytes[..count]).contains("x-api-key: test-private"));
+            stream.write_all(format!("HTTP/1.1 302 Found\r\nLocation: {target}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").as_bytes()).await.unwrap();
+        });
+        let client = Client::builder()
+            .no_proxy()
+            .redirect(headless_redirect_policy())
+            .build()
+            .unwrap();
+        let response = client
+            .get(format!("http://{address}/models"))
+            .header("x-api-key", "test-private")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::FOUND);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), other.accept())
+                .await
+                .is_err()
+        );
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn headless_redirect_allows_same_origin_but_limits_loops() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            for _ in 0..10 {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut bytes = [0; 4096];
+                let count = stream.read(&mut bytes).await.unwrap();
+                assert!(
+                    String::from_utf8_lossy(&bytes[..count]).contains("x-api-key: test-private")
+                );
+                stream.write_all(b"HTTP/1.1 302 Found\r\nLocation: /again\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await.unwrap();
+            }
+        });
+        let client = Client::builder()
+            .no_proxy()
+            .redirect(headless_redirect_policy())
+            .timeout(Duration::from_secs(5))
+            .build()
+            .unwrap();
+        let error = client
+            .get(format!("http://{address}/models"))
+            .header("x-api-key", "test-private")
+            .send()
+            .await
+            .unwrap_err();
+        assert!(error.is_redirect());
+        server.await.unwrap();
     }
 
     #[test]
