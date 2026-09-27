@@ -31,55 +31,25 @@ remain separate steps.
 
 ## Build and publication
 
-`.github/workflows/auth-core-release.yml` builds four native targets only when
-started manually. Select `feature/authentication-core-upstream` as the ref to
-build test artifacts without publishing. To publish, first push an
-`auth-core-v<hostVersion>` tag on a commit containing this workflow, then run
-the workflow manually with that tag as the ref. The release is published after
-**all** platforms have built and passed the isolated core/GUI protocol process
-tests. The version must match the executable's embedded `hostVersion`
-(currently `0.2.1`). Neither branch changes nor tag pushes start this workflow.
-The authentication tag prefix does not trigger the upstream desktop `v*`
-release workflow.
+`.github/workflows/auth-core-release.yml` runs only on manual dispatch. A branch
+run produces test artifacts; an `auth-core-v<hostVersion>` tag run publishes a
+Release after all four platforms pass the native core/GUI process tests and
+package verification. Neither branch changes nor tag pushes start this workflow.
 
-```text
-gh workflow run auth-core-release.yml --repo jintonglu6688/MyCodex-auth-host --ref feature/authentication-core-upstream
-gh workflow run auth-core-release.yml --repo jintonglu6688/MyCodex-auth-host --ref auth-core-v<hostVersion>
-```
+Maintainers: version changes, dispatch commands, GitHub publication, GitCode
+mirroring, frontend package pins and recovery are documented in
+`docs/mycodex-auth-release.md` in the MyCodex-auth-host source repository.
+That guide is for maintainers and is not included in runtime archives.
 
-GitHub requires a workflow with `workflow_dispatch` on the default branch to
-offer manual runs. The default branch contains a small entry point; select the
-authentication-core branch or a matching tag to run the full build workflow.
+The release contains four native archives, four target metadata files,
+`release-manifest.json` and `SHA256SUMS.txt`. Each archive includes this document
+as `RUNTIME.md`; keep it alongside the upstream `LICENSE` and dependency report.
+Published assets must not be replaced under an existing version.
 
-The workflow reuses `Package-MyCodexAuthCore.ps1` on Windows and
-`Package-MyCodexAuthCore.py` on Unix. `Release-MyCodexAuthCore.py` rejects dirty
-source, incorrect revisions/targets, missing platforms and changed archives.
-It emits one archive and metadata file per target, `release-manifest.json` and
-`SHA256SUMS.txt`. The full set is uploaded to a draft before it is published.
-A failed publication may leave a draft; resolve that draft deliberately before
-retrying. Published assets must not be replaced under an existing version.
-
-The embedded upstream/source revisions identify the code used; checksums detect
+The embedded upstream/source revisions identify the code used. Checksums detect
 changed files, but a checksum downloaded alongside a file is not an independent
-trust root. Consumers should pin the expected release metadata/hash. GitCode
-mirroring, frontend download/cache integration, automatic deployment and release
-signing policy are outside this workflow's scope.
+trust root; clients pin the expected release identity and hashes.
 
-Run the offline packaging checks with:
-
-```text
-python scripts/Test-MyCodexAuthRelease.py
-```
-
-Run native tests/builds with the repository's pinned Rust toolchain:
-
-```text
-cargo test --locked --release --manifest-path src-tauri/Cargo.toml --test mycodex_host_core --test mycodex_gui
-```
-
-The integration tests compile and run the native executable. The workflow packages
-that tested executable without a second Cargo build. For a standalone local build,
-use `cargo build --locked --release --manifest-path src-tauri/Cargo.toml --bin mycodex-auth-host`.
-
-Cloud build success means the published native binaries passed these checks on
-their runners. It does not mean any user machine was deployed or modified.
+Cloud build success means the binaries passed tests on their runners. It does
+not mean any user machine was deployed or modified. Release signing and target
+OS acceptance remain separate from these checks.
