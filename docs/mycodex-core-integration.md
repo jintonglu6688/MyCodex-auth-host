@@ -157,7 +157,7 @@ Codex 原 importer 对缺失 type 的条目默认 stdio，本次修复为存在 
 
 ## 编译身份和独立打包
 
-新入口的产物及内部 IPC 均使用协议 **2**，Host 版本 **0.2.0**。`--version-json` 不需要目录参数，不打开数据库；返回 `hostVersion`、`protocolVersion`、`upstreamRevision`、`sourceRevision`、`sourceDirty`、`target`、`sha256`。`ready` 和 `status` 包含相同身份，另带 `codexHome` 和 `dataDir`。固定上游仍是本文开头的提交。
+新入口的产物及内部 IPC 均使用协议 **2**，Host 版本 **0.2.1**。`--version-json` 不需要目录参数，不打开数据库；返回 `hostVersion`、`protocolVersion`、`upstreamRevision`、`sourceRevision`、`sourceDirty`、`target`、`sha256`。`ready` 和 `status` 包含相同身份，另带 `codexHome` 和 `dataDir`。固定上游仍是本文开头的提交。
 
 `build.rs` 在编译时读取 Git revision/dirty 和 Cargo TARGET 并写入产物；运行时不查询仓库，也不接受环境变量覆盖。构建脚本每次刷新身份，避免未跟踪文件或 worktree 变化留下旧的 clean 标记；不能读取 Git 时报告 unknown/dirty，打包脚本拒绝这类产物。SHA256 在首次查询时计算当前可执行文件并缓存。身份和校验和用于发现错包或不一致，不是发行签名。
 

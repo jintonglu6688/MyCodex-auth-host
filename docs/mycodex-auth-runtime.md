@@ -38,7 +38,7 @@ build test artifacts without publishing. To publish, first push an
 the workflow manually with that tag as the ref. The release is published after
 **all** platforms have built and passed the isolated core/GUI protocol process
 tests. The version must match the executable's embedded `hostVersion`
-(currently `0.2.0`). Neither branch changes nor tag pushes start this workflow.
+(currently `0.2.1`). Neither branch changes nor tag pushes start this workflow.
 The authentication tag prefix does not trigger the upstream desktop `v*`
 release workflow.
 
