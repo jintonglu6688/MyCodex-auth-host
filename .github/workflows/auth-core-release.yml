@@ -1,0 +1,18 @@
+# GitHub requires the manual trigger to exist on the default branch.
+# Runs against the authentication-core branch or a tag use that ref's full workflow.
+name: Authentication core
+
+on:
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  select-ref:
+    name: Select an authentication-core ref
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Explain the required ref
+        run: |
+          echo '::error::Select feature/authentication-core-upstream for test artifacts, or an auth-core-v* tag containing the full workflow to publish a release.'
+          exit 1
