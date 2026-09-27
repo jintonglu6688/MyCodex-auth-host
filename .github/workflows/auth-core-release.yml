@@ -1,0 +1,180 @@
+name: Authentication core
+
+on:
+  workflow_dispatch:
+  push:
+    tags: ['auth-core-v*']
+    branches: [feature/authentication-core-upstream]
+    paths:
+      - '.github/workflows/auth-core-release.yml'
+      - 'scripts/*MyCodex*'
+      - 'docs/mycodex-auth-runtime.md'
+      - 'src-tauri/**'
+      - 'rust-toolchain.toml'
+  pull_request:
+    paths:
+      - '.github/workflows/auth-core-release.yml'
+      - 'scripts/*MyCodex*'
+      - 'docs/mycodex-auth-runtime.md'
+      - 'src-tauri/**'
+      - 'rust-toolchain.toml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: auth-core-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_BUILD_JOBS: '2'
+  PYTHONDONTWRITEBYTECODE: '1'
+  MACOSX_DEPLOYMENT_TARGET: '12.0'
+
+jobs:
+  build:
+    name: Build ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-2022
+            target: x86_64-pc-windows-msvc
+          - os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+          - os: ubuntu-22.04-arm
+            target: aarch64-unknown-linux-gnu
+          - os: macos-14
+            target: aarch64-apple-darwin
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: '3.12'
+      - name: Install Linux build and runtime dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends build-essential pkg-config libssl-dev \
+            libwebkit2gtk-4.1-dev libgtk-3-dev librsvg2-dev libayatana-appindicator3-dev patchelf
+      - name: Install pinned Rust toolchain
+        run: |
+          rustup show
+          rustup target add '${{ matrix.target }}'
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          workspaces: src-tauri
+          key: auth-core-${{ matrix.target }}
+          cache-on-failure: false
+      - name: Check release tooling
+        run: python scripts/Test-MyCodexAuthRelease.py
+      - name: Build and test native core
+        run: |
+          cargo test --locked --release --manifest-path src-tauri/Cargo.toml \
+            --target '${{ matrix.target }}' --test mycodex_host_core --test mycodex_gui
+          # Integration tests build and run the same native executable packaged below.
+          test -z "$(git status --porcelain --untracked-files=normal)"
+      - name: Package Windows core
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          ./scripts/Package-MyCodexAuthCore.ps1 `
+            -BinaryPath "$env:GITHUB_WORKSPACE/src-tauri/target/${{ matrix.target }}/release/mycodex-auth-host.exe" `
+            -OutputDirectory "$env:GITHUB_WORKSPACE/artifacts/package"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          'Windows x64; native launch and isolated process tests passed on windows-2022.' |
+            Set-Content artifacts/package/dependencies.txt -Encoding utf8
+      - name: Package Unix core and inspect dependencies
+        if: runner.os != 'Windows'
+        run: |
+          binary="$GITHUB_WORKSPACE/src-tauri/target/${{ matrix.target }}/release/mycodex-auth-host"
+          python scripts/Package-MyCodexAuthCore.py package --binary "$binary" --output artifacts/package
+          if [[ "$RUNNER_OS" == Linux ]]; then
+            ldd "$binary" > artifacts/package/dependencies.txt
+            if grep -q 'not found' artifacts/package/dependencies.txt; then
+              cat artifacts/package/dependencies.txt
+              exit 1
+            fi
+            readelf --version-info "$binary" >> artifacts/package/dependencies.txt
+          else
+            otool -L "$binary" > artifacts/package/dependencies.txt
+            # Do not ship binaries that silently depend on the runner's Homebrew installation.
+            if grep -Eq '/opt/homebrew/|/usr/local/|@rpath/' artifacts/package/dependencies.txt; then
+              cat artifacts/package/dependencies.txt
+              exit 1
+            fi
+          fi
+      - name: Archive verified native package
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          cp docs/mycodex-auth-runtime.md artifacts/package/RUNTIME.md
+          python scripts/Release-MyCodexAuthCore.py pack --package artifacts/package \
+            --output artifacts/release --target "$TARGET" --revision "$GITHUB_SHA"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: auth-core-${{ matrix.target }}
+          path: artifacts/release/*
+          if-no-files-found: error
+          retention-days: 14
+
+  collect:
+    name: Verify complete release
+    needs: build
+    runs-on: ubuntu-22.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: auth-core-*
+          path: artifacts/release
+          merge-multiple: true
+      - name: Verify all platforms and create checksums
+        shell: bash
+        run: |
+          args=()
+          if [[ "$GITHUB_REF" == refs/tags/* ]]; then args=(--tag "$GITHUB_REF_NAME"); fi
+          python3 scripts/Release-MyCodexAuthCore.py assemble --folder artifacts/release \
+            --revision "$GITHUB_SHA" "${args[@]}"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: auth-core-release
+          path: artifacts/release/*
+          if-no-files-found: error
+          retention-days: 14
+
+  publish:
+    name: Publish tagged release
+    needs: collect
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/auth-core-v')
+    runs-on: ubuntu-22.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: auth-core-release
+          path: release
+      - name: Upload complete draft then publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        shell: bash
+        run: |
+          gh release create "$RELEASE_TAG" --verify-tag --draft --title "MyCodex $RELEASE_TAG" \
+            --notes 'Authentication core for Windows x64, Linux x64/ARM64 and macOS Apple Silicon. See RUNTIME.md and dependencies.txt inside each archive for runtime requirements. No Intel Mac build is provided.'
+          gh release upload "$RELEASE_TAG" release/*
+          gh release edit "$RELEASE_TAG" --draft=false --latest=false
