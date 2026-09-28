@@ -48,7 +48,7 @@ def validate(manifest, target, revision):
             and manifest.get("sourceRevision") == revision, "Unexpected source revision.")
     require(manifest.get("sourceDirty") is False, "Cloud releases require clean source.")
     require(manifest.get("schemaVersion") == 1 and manifest.get("protocolVersion") == 2
-            and manifest.get("hostVersion") == "0.2.1"
+            and manifest.get("hostVersion") == "0.2.2"
             and manifest.get("upstreamRevision") == UPSTREAM, "Incompatible core identity.")
     executable = NAME + (".exe" if "windows" in target else "")
     require(manifest.get("executable") == executable, "Unexpected executable name.")

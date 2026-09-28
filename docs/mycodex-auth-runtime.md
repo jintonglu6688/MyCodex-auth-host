@@ -29,6 +29,28 @@ Native CI tests do not establish Gatekeeper acceptance or test every supported
 OS version. Packaging, remote installation and OS compatibility acceptance
 remain separate steps.
 
+## Automatic capture diagnostics
+
+Each target's private authentication data directory contains `auto-capture.jsonl`.
+On local Windows this is under `%LOCALAPPDATA%\MyCodex\auth-core\<target-hash>`;
+WSL and SSH hosts use their own configured `--data-dir`. The file rolls over at
+1 MiB to `auto-capture.previous.jsonl`, retaining one archive across restarts.
+
+Each completed capture attempt records its UTC time, process/source revision,
+read/write trigger, identity kind, provider/candidate/exact-match counts, selection
+branch, final state or error code, and the last stage reached. Mutation flags
+indicate whether account import, provider persistence and current-provider
+selection completed before a failure. `new_identity` means no existing provider
+matched; `identity_fallback` means several known variants required a stable choice.
+Other branches describe exact, previous-provider and single-identity matches.
+
+Provider and account references are SHA-256 hashes of internal record IDs for
+correlation. Logs exclude names, emails, identity claims, credentials, URLs and
+configuration contents. Logging is best effort: failure to write a log does not
+change authentication behavior. When investigating another unexpected capture,
+preserve both log files promptly; old records are bounded by rotation. These logs
+cannot reconstruct captures that occurred before this diagnostic feature existed.
+
 ## Build and publication
 
 `.github/workflows/auth-core-release.yml` runs only on manual dispatch. A branch

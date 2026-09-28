@@ -5,6 +5,7 @@ use crate::{codex_config as codex, AppState, AppType, McpService, Provider, Prov
 use futures::executor::block_on;
 use serde_json::{json, Value};
 
+mod diagnostics;
 mod identity;
 
 pub(super) struct Outcome {
@@ -30,12 +31,12 @@ pub(super) fn read(state: &AppState) -> Result<Outcome> {
         Ok(guard) => guard,
         Err(error) => return Ok(Outcome::unavailable(error)),
     };
-    reconcile(state)
+    reconcile(state, "read")
 }
 
 pub(super) fn before_write(state: &AppState) -> Result<()> {
     let previous = ProviderService::current(state, AppType::Codex).map_err(service_error)?;
-    let result = reconcile(state)?;
+    let result = reconcile(state, "before_write")?;
     if let Some(error) = result.error {
         return Err(error);
     }
@@ -46,8 +47,11 @@ pub(super) fn before_write(state: &AppState) -> Result<()> {
 }
 
 // The caller owns lifecycle::mutation. Recoverable live errors leave the archive readable.
-pub(super) fn reconcile(state: &AppState) -> Result<Outcome> {
-    match capture(state) {
+fn reconcile(state: &AppState, source: &'static str) -> Result<Outcome> {
+    let mut trace = diagnostics::Trace::new(source);
+    let result = capture(state, &mut trace);
+    trace.finish(&result);
+    match result {
         Ok(result) => Ok(result),
         Err("database_failed" | "account_store_invalid") => Err("account_store_invalid"),
         Err(error) => Ok(Outcome::unavailable(error)),
@@ -118,35 +122,51 @@ fn set_current(state: &AppState, id: &str) -> Result<()> {
     .map_err(service_error)
 }
 
-fn capture(state: &AppState) -> Result<Outcome> {
+fn capture(state: &AppState, trace: &mut diagnostics::Trace) -> Result<Outcome> {
     let snapshot = Snapshot::read()?;
     let previous = ProviderService::current(state, AppType::Codex).map_err(service_error)?;
+    trace.previous_ref = diagnostics::reference(&previous);
+    trace.stage = "check_route_owner";
     if lifecycle::owns_snapshot(state, &snapshot.live)? {
         let provider = gui_provider::stored(state, &previous)?;
         if !lifecycle::conversion(&provider)? {
             return Err("route_live_changed_externally");
         }
+        trace.kind = "routed";
+        trace.branch = "owned_route";
+        trace.provider_ref = diagnostics::reference(&previous);
         lifecycle::resume_owned(state)?;
+        trace.stage = "complete";
         return Ok(Outcome {
             current: previous,
             state: "current",
             error: None,
         });
     }
+    trace.stage = "identify_live";
     let detected = identity::identify(&snapshot.live)?;
     snapshot.unchanged()?;
     // No restore: the external files are authoritative, including signed-out state.
+    trace.stage = "detach_external";
     lifecycle::detach_external(state)?;
     let Some(detected) = detected else {
         snapshot.unchanged()?;
+        trace.kind = "signed_out";
+        trace.branch = "signed_out";
+        trace.stage = "set_current";
         set_current(state, "")?;
+        trace.current_set = true;
+        trace.stage = "complete";
         return Ok(Outcome {
             current: String::new(),
             state: "signed_out",
             error: None,
         });
     };
+    trace.kind = if detected.chatgpt { "chatgpt" } else { "api" };
+    trace.stage = "match_providers";
     let providers = ProviderService::list(state, AppType::Codex).map_err(service_error)?;
+    trace.provider_count = Some(providers.len());
     let mut candidates = Vec::new();
     let mut exact = Vec::new();
     for provider in providers.values() {
@@ -157,18 +177,34 @@ fn capture(state: &AppState) -> Result<Outcome> {
             }
         }
     }
+    trace.candidate_count = Some(candidates.len());
+    trace.exact_count = Some(exact.len());
     exact.sort();
     let chosen = if exact.iter().any(|id| id == &previous) {
+        trace.branch = "exact_previous";
         Some(previous.clone())
     } else if !exact.is_empty() {
+        trace.branch = "exact_match";
         exact.first().cloned()
     } else if candidates.iter().any(|p| p.id == previous) {
+        trace.branch = "identity_previous";
         Some(previous.clone())
     } else if candidates.len() == 1 {
+        trace.branch = "single_identity";
         Some(candidates[0].id.clone())
     } else {
-        None
+        // Several variants of a known identity are still an existing account.
+        // Use a stable fallback, as with ties in exact matches above. Capture
+        // preserves each card's private settings and never rewrites live files.
+        trace.branch = if candidates.is_empty() {
+            "new_identity"
+        } else {
+            "identity_fallback"
+        };
+        candidates.iter().map(|provider| provider.id.clone()).min()
     };
+    trace.provider_ref = chosen.as_deref().and_then(diagnostics::reference);
+    trace.stage = "import_account";
     let account = if detected.chatgpt {
         Some(block_on(state.codex_oauth_manager.import_existing_login(&snapshot.live["auth"]))
             .map_err(|error| match error {
@@ -179,7 +215,10 @@ fn capture(state: &AppState) -> Result<Outcome> {
     } else {
         None
     };
+    trace.account_imported = account.is_some();
+    trace.account_ref = account.as_deref().and_then(diagnostics::reference);
     snapshot.unchanged()?;
+    trace.stage = "prepare_provider";
     let created = chosen.is_none();
     let mut provider = match chosen {
         Some(id) => gui_provider::stored(state, &id)?,
@@ -196,6 +235,7 @@ fn capture(state: &AppState) -> Result<Outcome> {
             provider
         }
     };
+    trace.provider_ref = diagnostics::reference(&provider.id);
     if let Some(account) = &account {
         if created {
             if let Some(saved) = block_on(state.codex_oauth_manager.list_accounts())
@@ -217,6 +257,7 @@ fn capture(state: &AppState) -> Result<Outcome> {
     } else if created {
         provider.settings_config["auth"] = detected.saved_auth.clone();
     }
+    trace.stage = "initialize_capture";
     // Only initialization imports MCP; ordinary list refresh is not an MCP sync.
     if state
         .db
@@ -234,6 +275,7 @@ fn capture(state: &AppState) -> Result<Outcome> {
             .map_err(service_error)?;
     }
     if created {
+        trace.stage = "capture_common";
         let mut result = crate::services::provider::SwitchResult::default();
         ProviderService::sync_common_config_snippet_from_live(
             state,
@@ -256,6 +298,7 @@ fn capture(state: &AppState) -> Result<Outcome> {
             .map_err(service_error)?;
     }
     snapshot.unchanged()?;
+    trace.stage = "save_provider";
     // Saving this row via DAO deliberately bypasses add's first-provider activation.
     if created
         || providers
@@ -266,9 +309,13 @@ fn capture(state: &AppState) -> Result<Outcome> {
             .db
             .save_provider("codex", &provider)
             .map_err(service_error)?;
+        trace.provider_saved = true;
     }
     snapshot.unchanged()?;
+    trace.stage = "set_current";
     set_current(state, &provider.id)?;
+    trace.current_set = true;
+    trace.stage = "record_auth_owner";
     if let Some(account) = account {
         if !codex::codex_auth_matches_recorded_managed_oauth(&snapshot.live["auth"], &account)
             .map_err(|_| "capture_incomplete")?
@@ -278,6 +325,7 @@ fn capture(state: &AppState) -> Result<Outcome> {
         }
     }
     snapshot.unchanged()?;
+    trace.stage = "complete";
     Ok(Outcome {
         current: provider.id,
         state: "current",

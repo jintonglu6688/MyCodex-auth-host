@@ -78,7 +78,7 @@ pub(super) fn presets() -> Result<Value> {
                 _ => return Err("invalid_presets"),
             }
         };
-        let mut advanced = json!({});
+        let mut advanced = gui_provider::read_context(&config)?;
         for key in [
             "codexChatReasoning",
             "promptCacheRouting",

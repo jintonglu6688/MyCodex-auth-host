@@ -71,7 +71,15 @@ impl Gui {
             "{}",
             String::from_utf8_lossy(&output.stderr)
         );
-        assert!(!String::from_utf8_lossy(&output.stdout).contains("synthetic-secret"));
+        let response: Value = serde_json::from_slice(&output.stdout).unwrap();
+        // Explicit raw editors can display credentials; errors and ordinary RPCs cannot.
+        if !matches!(
+            method,
+            "gui/config/provider/preview" | "gui/config/common/get"
+        ) || response.get("error").is_some()
+        {
+            assert!(!String::from_utf8_lossy(&output.stdout).contains("synthetic-secret"));
+        }
         assert!(!String::from_utf8_lossy(&output.stderr).contains("synthetic-secret"));
         assert!(!String::from_utf8_lossy(&output.stderr).contains("mcp-private-marker"));
         serde_json::from_slice(&output.stdout).unwrap()
@@ -102,6 +110,52 @@ fn save(id: &str) -> Value {
         "model":"model-a","presetId":"custom","commonConfigEnabled":true,
         "models":[{"model":"model-a","displayName":"Model A","contextWindow":32000,"reasoningLevels":["low","high"],"defaultReasoningLevel":"low","extension":true}],
         "advanced":{"requestHeaders":{"x-special":"synthetic-secret-header"},"queryParams":{"x-key":"synthetic-secret-query"}}})
+}
+
+#[test]
+fn context_settings_survive_save_restart_and_disable_with_or_without_conversion() {
+    for kind in ["responses", "chat_completions", "anthropic"] {
+        let mut gui = Gui::new();
+        gui.start();
+        assert!(gui.ok("status", json!({}))["capabilities"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("contextSettings")));
+        let mut params = save("context-settings");
+        params["kind"] = json!(kind);
+        params["commonConfigEnabled"] = json!(false);
+        params["models"] = json!([]);
+        params["advanced"] = json!({"modelContextWindow":1000000,
+            "autoCompactTokenLimit":850000,"remoteCompaction":true});
+        gui.ok("gui/provider/save", params.clone());
+        let live: toml::Value = toml::from_str(&gui.config()).unwrap();
+        assert_eq!(live["model_context_window"].as_integer(), Some(1000000));
+        assert_eq!(
+            live["model_auto_compact_token_limit"].as_integer(),
+            Some(850000)
+        );
+        gui.stop();
+        gui.start();
+        let current = gui.ok("gui/provider/get", json!({"providerId":"context-settings"}));
+        assert_eq!(current["advanced"]["autoCompactTokenLimit"], 850000);
+        assert_eq!(current["advanced"]["remoteCompaction"], true);
+        params["expectedVersion"] = current["version"].clone();
+        params["name"] = json!("Renamed");
+        params["advanced"] = json!({});
+        let renamed = gui.ok("gui/provider/save", params.clone());
+        assert_eq!(renamed["advanced"]["modelContextWindow"], 1000000);
+        assert_eq!(renamed["advanced"]["remoteCompaction"], true);
+        params["expectedVersion"] = renamed["version"].clone();
+        params["advanced"] = json!({"modelContextWindow":null,
+            "autoCompactTokenLimit":null,"remoteCompaction":false});
+        let disabled = gui.ok("gui/provider/save", params);
+        assert!(disabled["advanced"].get("modelContextWindow").is_none());
+        assert!(disabled["advanced"].get("autoCompactTokenLimit").is_none());
+        assert_eq!(disabled["advanced"]["remoteCompaction"], false);
+        let live: toml::Value = toml::from_str(&gui.config()).unwrap();
+        assert!(live.get("model_context_window").is_none());
+        assert!(live.get("model_auto_compact_token_limit").is_none());
+    }
 }
 
 fn switch_gui(gui: &Gui, id: &str, operation: &str) {
@@ -938,4 +992,324 @@ fn chatgpt_catalog_repair_on_apply_preserves_live_auth_and_stops_discovery() {
     gui.stop();
     gui.start();
     assert!(!gui.config().contains("model_catalog_json"));
+}
+
+#[test]
+fn toml_provider_drafts_roundtrip_without_writing_until_save() {
+    let mut gui = Gui::new();
+    gui.start();
+    let mut params = save("draft");
+    params["kind"] = json!("chat_completions");
+    params["commonConfigEnabled"] = json!(false);
+    let saved = gui.ok("gui/provider/save", params.clone());
+    params["expectedVersion"] = saved["version"].clone();
+    let before = gui.config();
+    let preview = gui.ok("gui/config/provider/preview", params.clone());
+    let raw = preview["text"].as_str().unwrap();
+    assert!(raw.contains("synthetic-secret-header"));
+    assert!(!raw.contains("127.0.0.1"));
+    let raw = raw
+        .replace("model-a", "model-edited")
+        .replace("https://example.invalid/v1", "https://edited.invalid/v1")
+        .replace("synthetic-secret-header", "synthetic-secret-edited");
+    params["editedText"] = json!(format!(
+        "# keep comment\nmodel_context_window = 1000000\ncustom_preference = 'retained'\n{raw}"
+    ));
+    let edited = gui.ok("gui/config/provider/preview", params.clone());
+    assert_eq!(edited["model"], "model-edited");
+    assert_eq!(edited["baseUrl"], "https://edited.invalid/v1");
+    assert_eq!(edited["advanced"]["modelContextWindow"], 1000000);
+    assert_eq!(gui.config(), before);
+    let unchanged = gui.ok("gui/provider/get", json!({"providerId":"draft"}));
+    assert_eq!(unchanged["version"], saved["version"]);
+    params["configToml"] = edited["text"].clone();
+    params["model"] = edited["model"].clone();
+    params["baseUrl"] = edited["baseUrl"].clone();
+    params["advanced"] = edited["advanced"].clone();
+    params.as_object_mut().unwrap().remove("editedText");
+    let final_row = gui.ok("gui/provider/save", params.clone());
+    params["expectedVersion"] = final_row["version"].clone();
+    let reopened = gui.ok("gui/config/provider/preview", params.clone());
+    assert!(reopened["text"]
+        .as_str()
+        .unwrap()
+        .contains("synthetic-secret-edited"));
+    assert!(reopened["text"]
+        .as_str()
+        .unwrap()
+        .contains("# keep comment"));
+    assert!(reopened["text"]
+        .as_str()
+        .unwrap()
+        .contains("custom_preference"));
+    for raw in [
+        "bad = [synthetic-secret",
+        "model_provider = 3",
+        "[model_providers]\ncustom=3",
+    ] {
+        params["editedText"] = json!(raw);
+        assert_eq!(
+            gui.call("gui/config/provider/preview", params.clone())["error"]["message"],
+            "invalid_config"
+        );
+    }
+    let mut blank = save("new-draft");
+    blank["name"] = json!("");
+    blank["model"] = json!("");
+    blank["baseUrl"] = json!("");
+    gui.ok("gui/config/provider/preview", blank);
+    assert_eq!(
+        gui.ok("gui/provider/list", json!({}))["providers"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+}
+
+#[test]
+fn common_editor_uses_native_merge_clear_and_version_checks_with_and_without_route() {
+    for kind in ["responses", "chat_completions"] {
+        let mut gui = Gui::new();
+        gui.start();
+        let mut params = save("common-editor");
+        params["kind"] = json!(kind);
+        gui.ok("gui/provider/save", params);
+        let original = gui.ok("gui/config/common/get", json!({}));
+        let before = gui.config();
+        let invalid =
+            json!({"text":"bad=[synthetic-secret", "expectedVersion":original["version"]});
+        assert_eq!(
+            gui.call("gui/config/common/save", invalid)["error"]["message"],
+            "invalid_config"
+        );
+        assert_eq!(before, gui.config());
+        let update = json!({"text":"model_reasoning_effort='high'\nmodel_context_window=1000000\n", "expectedVersion":original["version"]});
+        assert_eq!(
+            gui.ok("gui/config/common/save", update.clone())["globalApplied"],
+            true
+        );
+        assert_eq!(
+            gui.call("gui/config/common/save", update)["error"]["message"],
+            "version_conflict"
+        );
+        let live: toml::Value = gui.config().parse().unwrap();
+        assert_eq!(live["model_context_window"].as_integer(), Some(1000000));
+        gui.stop();
+        gui.start();
+        let current = gui.ok("gui/config/common/get", json!({}));
+        assert!(current["text"]
+            .as_str()
+            .unwrap()
+            .contains("model_reasoning_effort"));
+        gui.ok(
+            "gui/config/common/save",
+            json!({"text":"", "expectedVersion":current["version"]}),
+        );
+        let live: toml::Value = gui.config().parse().unwrap();
+        assert!(live.get("model_context_window").is_none());
+        assert!(live.get("model_reasoning_effort").is_none());
+        assert_eq!(gui.ok("gui/config/common/get", json!({}))["text"], "");
+    }
+}
+
+#[test]
+fn provider_editor_shows_live_and_common_toml_like_native_editor() {
+    let mut gui = Gui::new();
+    external_account(&gui, "editor", "team", "model-a");
+    gui.start();
+    let list = gui.ok("gui/provider/list", json!({}));
+    let row = &list["providers"][0];
+    let preview = gui.ok(
+        "gui/config/provider/preview",
+        json!({
+            "id": row["id"], "expectedVersion":row["version"], "name":"Named account",
+            "kind":"chatgpt", "model":row["model"], "accountId":row["accountId"],
+            "commonConfigEnabled":true, "advanced":row["advanced"]
+        }),
+    );
+    let config: toml::Value = preview["text"].as_str().unwrap().parse().unwrap();
+    assert_eq!(
+        config
+            .get("model_reasoning_summary")
+            .and_then(toml::Value::as_str),
+        Some("detailed"),
+        "Native editor includes the active live configuration and common fields"
+    );
+}
+
+#[test]
+fn known_chatgpt_variants_do_not_trigger_another_auto_capture() {
+    for with_copy in [false, true] {
+        let mut gui = Gui::new();
+        external_account(&gui, "existing", "team", "model-a");
+        gui.start();
+        let list = gui.ok("gui/provider/list", json!({}));
+        let row = &list["providers"][0];
+        if with_copy {
+            gui.ok(
+                "gui/provider/copy",
+                json!({"providerId":row["id"],"expectedVersion":row["version"],
+        "newId":"manual-copy","name":"Manual variant"}),
+            );
+        }
+        external_account(&gui, "other", "team", "other-model");
+        gui.ok("gui/provider/list", json!({}));
+        let live = external_account(&gui, "existing", "team", "externally-changed-model");
+        let refreshed = gui.ok("gui/provider/list", json!({}));
+        assert_eq!(
+        refreshed["providers"].as_array().unwrap().len(),
+        if with_copy { 3 } else { 2 },
+        "An already-known account with ambiguous provider variants must not create another card"
+    );
+        assert_eq!(refreshed["liveState"], "current");
+        assert!(
+            refreshed["currentProviderId"] == row["id"]
+                || refreshed["currentProviderId"] == "manual-copy"
+        );
+        assert_live_unchanged(&gui, &live);
+        let again = gui.ok("gui/provider/list", json!({}));
+        assert_eq!(again["currentProviderId"], refreshed["currentProviderId"]);
+        assert_eq!(
+            again["providers"].as_array().unwrap().len(),
+            if with_copy { 3 } else { 2 }
+        );
+    }
+}
+
+#[test]
+fn native_cc_edit_of_single_chatgpt_card_keeps_existing_provider() {
+    for use_other_current in [false, true] {
+        let mut gui = Gui::new();
+        external_account(&gui, "single-account", "team", "model-a");
+        gui.start();
+        let list = gui.ok("gui/provider/list", json!({}));
+        let row = &list["providers"][0];
+        gui.ok(
+            "gui/provider/save",
+            json!({"id":row["id"],"expectedVersion":row["version"],
+            "name":"Manual account", "kind":"chatgpt", "model":"model-a",
+            "accountId":row["accountId"], "commonConfigEnabled":true}),
+        );
+        if use_other_current {
+            external_account(&gui, "other", "team", "other-model");
+            gui.ok("gui/provider/list", json!({}));
+        }
+        external_account(&gui, "single-account", "team", "model-a");
+        let config = gui.config();
+        let path = gui.root.path().join("codex/config.toml");
+        for enabled in [true, false] {
+            std::fs::write(&path, if enabled {
+                format!("{config}model_context_window=1000000\nmodel_auto_compact_token_limit=900000\n")
+            } else { config.clone() }).unwrap();
+            let expected = gui.config();
+            let captured = gui.ok("gui/provider/list", json!({}));
+            assert_eq!(
+                captured["providers"].as_array().unwrap().len(),
+                if use_other_current { 2 } else { 1 }
+            );
+            assert_eq!(captured["currentProviderId"], row["id"]);
+            let current = captured["providers"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|p| p["id"] == row["id"])
+                .unwrap();
+            assert_eq!(current["name"], "Manual account");
+            assert_eq!(gui.config(), expected);
+        }
+    }
+}
+
+#[test]
+fn capture_diagnostics_record_decisions_and_partial_failure_without_private_data() {
+    let mut gui = Gui::new();
+    external_account(
+        &gui,
+        "diagnostic-private-person",
+        "diagnostic-private-team",
+        "private-model",
+    );
+    gui.start();
+    let initial = gui.ok("gui/provider/list", json!({}));
+    let id = initial["currentProviderId"].as_str().unwrap();
+    let path = gui.root.path().join("store/auto-capture.jsonl");
+    let records = || -> Vec<Value> {
+        let text = std::fs::read_to_string(&path).unwrap();
+        for private in [
+            "synthetic-secret",
+            "diagnostic-private",
+            "example.invalid",
+            "private-model",
+            id,
+        ] {
+            assert!(!text.contains(private), "Diagnostic leaked private input");
+        }
+        text.lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect()
+    };
+    let first = records();
+    let created = first.iter().find(|v| v["action"] == "created").unwrap();
+    assert_eq!(created["capture"]["branch"], "new_identity");
+    assert_eq!(created["capture"]["candidateCount"], 0);
+    assert_eq!(created["capture"]["providerSaved"], true);
+    assert_eq!(created["capture"]["accountImported"], true);
+    assert_eq!(created["capture"]["stage"], "complete");
+    assert_eq!(
+        created["capture"]["providerRef"].as_str().unwrap().len(),
+        64
+    );
+    assert_eq!(first.last().unwrap()["action"], "reused");
+    external_account(
+        &gui,
+        "diagnostic-private-person",
+        "diagnostic-private-team",
+        "changed-private-model",
+    );
+    gui.ok("gui/provider/list", json!({}));
+    let reused = records().pop().unwrap();
+    assert_eq!(reused["capture"]["branch"], "identity_previous");
+    assert_eq!(reused["capture"]["candidateCount"], 1);
+    assert_eq!(reused["capture"]["exactCount"], 0);
+    assert_eq!(
+        reused["capture"]["providerRef"],
+        created["capture"]["providerRef"]
+    );
+    assert_eq!(reused["capture"]["providerSaved"], false);
+    let db = rusqlite::Connection::open(gui.root.path().join("store/cc-switch.db")).unwrap();
+    db.execute_batch("CREATE TRIGGER fail_capture_diagnostic BEFORE INSERT ON providers BEGIN SELECT RAISE(FAIL, 'synthetic-secret-failure'); END;").unwrap();
+    external_account(
+        &gui,
+        "diagnostic-private-other",
+        "diagnostic-private-team",
+        "private-model",
+    );
+    let failed = gui.ok("gui/provider/list", json!({}));
+    assert_eq!(failed["liveState"], "unavailable");
+    let failure = records().pop().unwrap();
+    assert_eq!(failure["action"], "failed");
+    assert_eq!(failure["capture"]["stage"], "save_provider");
+    assert_eq!(failure["capture"]["accountImported"], true);
+    assert_eq!(failure["capture"]["providerSaved"], false);
+    assert_eq!(failure["capture"]["currentSet"], false);
+    assert!(failure["error"].is_string());
+    db.execute_batch("DROP TRIGGER fail_capture_diagnostic;")
+        .unwrap();
+    gui.stop();
+    gui.start();
+    assert!(records().len() > first.len());
+    assert!(records().iter().any(|v| v["action"] == "failed"));
+    // A broken log destination must not block or roll back capture.
+    std::fs::remove_file(&path).unwrap();
+    std::fs::create_dir(&path).unwrap();
+    external_account(
+        &gui,
+        "diagnostic-private-new",
+        "diagnostic-private-team",
+        "private-model",
+    );
+    let result = gui.ok("gui/provider/list", json!({}));
+    assert_eq!(result["liveState"], "current");
+    assert_eq!(result["providers"].as_array().unwrap().len(), 3);
 }

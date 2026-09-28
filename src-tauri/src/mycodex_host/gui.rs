@@ -38,7 +38,7 @@ fn selected(host: &Host, params: &Value, check: bool) -> Result<(Provider, Provi
     Ok((stored, edited))
 }
 
-fn fingerprint(host: &Host) -> Result<String> {
+pub(super) fn fingerprint(host: &Host) -> Result<String> {
     let state = &host.state;
     let mut files = Vec::new();
     for path in [
@@ -56,9 +56,49 @@ fn fingerprint(host: &Host) -> Result<String> {
         "common":state.db.get_config_snippet("codex").map_err(service_error)?})))
 }
 
+pub(super) fn edit_base(host: &Host, params: &Value) -> Result<(Option<Provider>, Provider)> {
+    let state = &host.state;
+    let id = params["id"].as_str().ok_or("invalid_params")?;
+    valid_id(id)?;
+    let previous = state
+        .db
+        .get_provider_by_id(id, "codex")
+        .map_err(service_error)?;
+    let edited = if let Some(stored) = &previous {
+        let edited = form::snapshot(state, stored)?;
+        if params["expectedVersion"].as_str() != Some(form::version(stored, &edited).as_str()) {
+            return Err("version_conflict");
+        }
+        edited
+    } else {
+        if params
+            .get("expectedVersion")
+            .is_some_and(|v| v.as_str().is_some_and(|s| !s.is_empty()))
+        {
+            return Err("version_conflict");
+        }
+        let mut provider =
+            gui_catalog::native_preset(params["presetId"].as_str().unwrap_or("custom"))?
+                .unwrap_or_else(|| {
+                    Provider::with_id(
+                        id.into(),
+                        String::new(),
+                        json!({"auth":{},"config":""}),
+                        None,
+                    )
+                });
+        provider.id = id.into();
+        provider
+    };
+    Ok((previous, edited))
+}
+
 pub(super) fn handle(host: &Host, method: &str, params: &Value) -> Result<Value> {
     let state = &host.state;
     match method {
+        method if method.starts_with("gui/config/") => {
+            super::gui_config::handle(host, method, params)
+        }
         "gui/preset/list" => gui_catalog::presets(),
         "gui/model/fetch" => gui_catalog::fetch_models(state, params),
         method if method.starts_with("gui/mcp/") => super::gui_mcp::handle(host, method, params),
@@ -103,39 +143,7 @@ pub(super) fn handle(host: &Host, method: &str, params: &Value) -> Result<Value>
             let _guard = lifecycle::mutation()?;
             auto_capture::before_write(state)?;
             let id = params["id"].as_str().ok_or("invalid_params")?;
-            valid_id(id)?;
-            let previous = state
-                .db
-                .get_provider_by_id(id, "codex")
-                .map_err(service_error)?;
-            let edited = if let Some(stored) = &previous {
-                let edited = form::snapshot(state, stored)?;
-                if params["expectedVersion"].as_str()
-                    != Some(form::version(stored, &edited).as_str())
-                {
-                    return Err("version_conflict");
-                }
-                edited
-            } else {
-                if params
-                    .get("expectedVersion")
-                    .is_some_and(|v| v.as_str().is_some_and(|s| !s.is_empty()))
-                {
-                    return Err("version_conflict");
-                }
-                let mut provider =
-                    gui_catalog::native_preset(params["presetId"].as_str().unwrap_or("custom"))?
-                        .unwrap_or_else(|| {
-                            Provider::with_id(
-                                id.into(),
-                                String::new(),
-                                json!({"auth":{},"config":""}),
-                                None,
-                            )
-                        });
-                provider.id = id.into();
-                provider
-            };
+            let (previous, edited) = edit_base(host, params)?;
             let mut edited = form::edit(edited, params)?;
             if let Some(account) = edited
                 .meta

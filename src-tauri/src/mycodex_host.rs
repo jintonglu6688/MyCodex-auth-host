@@ -14,6 +14,7 @@ pub(crate) mod auto_capture;
 mod gui;
 mod gui_accounts;
 mod gui_catalog;
+mod gui_config;
 mod gui_mcp;
 mod gui_provider;
 mod identity;
@@ -203,6 +204,7 @@ fn handle(host: &Host, request: &Request, resident: bool) -> Result<Value> {
             | "provider/update"
             | "provider/switch"
             | "gui/provider/save"
+            | "gui/config/common/save"
             | "gui/provider/copy"
             | "gui/provider/delete"
             | "gui/provider/apply"
@@ -231,6 +233,8 @@ fn handle(host: &Host, request: &Request, resident: bool) -> Result<Value> {
                     "codexManagedAccounts",
                     "codexConversionLifecycle",
                     "commonConfig",
+                    "contextSettings",
+                    "configEditing",
                     "guiProviderManagement",
                     "guiMcpManagement",
                     "globalAuthCapture",

@@ -4,6 +4,10 @@ use crate::{AppState, AppType, Provider, ProviderService};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
+#[cfg(test)]
+#[path = "gui_provider_context_tests.rs"]
+mod context_tests;
+
 pub(super) fn hash(value: &Value) -> String {
     fn ordered(value: &Value) -> Value {
         match value {
@@ -188,12 +192,12 @@ fn config(provider: &Provider) -> Result<toml::Value> {
 
 pub(super) fn read_advanced(provider: &Provider) -> Result<Value> {
     let config = config(provider)?;
+    let mut result = read_context(&config)?;
     let source = config
         .get("model_provider")
         .and_then(toml::Value::as_str)
         .unwrap_or("openai");
     let table = config.get("model_providers").and_then(|p| p.get(source));
-    let mut result = json!({});
     for (native, flat) in [
         ("env_key", "envKey"),
         ("http_headers", "requestHeaders"),
@@ -236,13 +240,35 @@ pub(super) fn read_advanced(provider: &Provider) -> Result<Value> {
     Ok(result)
 }
 
+pub(super) fn read_context(config: &toml::Value) -> Result<Value> {
+    let source = config
+        .get("model_provider")
+        .and_then(toml::Value::as_str)
+        .unwrap_or("openai");
+    let table = config.get("model_providers").and_then(|p| p.get(source));
+    let mut result = json!({"remoteCompaction":
+        crate::codex_config::is_custom_codex_model_provider_id(source)
+            && table.and_then(|t| t.get("name")).and_then(toml::Value::as_str) == Some("OpenAI")});
+    for (native, flat) in [
+        ("model_context_window", "modelContextWindow"),
+        ("model_auto_compact_token_limit", "autoCompactTokenLimit"),
+    ] {
+        if let Some(value) = config.get(native) {
+            result[flat] = serde_json::to_value(value).map_err(|_| "invalid_config")?;
+        }
+    }
+    Ok(result)
+}
+
 pub(super) fn masked(value: &Value) -> Value {
     match value {
         Value::Object(map) => Value::Object(
             map.iter()
                 .map(|(key, value)| {
                     let name = key.to_ascii_lowercase().replace(['_', '-'], "");
+                    let numeric_limit = name == "autocompacttokenlimit" && value.is_i64();
                     let secret = !matches!(name.as_str(), "maxtokens" | "maxoutputtokens")
+                        && !numeric_limit
                         && [
                             "authorization",
                             "apikey",
@@ -300,15 +326,77 @@ pub(super) fn restore_masks(value: &mut Value, previous: Option<&Value>) -> Resu
     Ok(())
 }
 
-pub(super) fn edit(mut provider: Provider, params: &Value) -> Result<Provider> {
+pub(super) fn validate_toml(text: &str) -> Result<()> {
+    if text.len() > 1024 * 1024 {
+        return Err("invalid_config");
+    }
+    text.parse::<toml_edit::DocumentMut>()
+        .map_err(|_| "invalid_config")?;
+    Ok(())
+}
+
+pub(super) fn replace_config(provider: &mut Provider, text: &str) -> Result<()> {
+    validate_toml(text)?;
+    let config: toml::Value = text.parse().map_err(|_| "invalid_config")?;
+    for key in ["model", "model_provider"] {
+        if config.get(key).is_some_and(|v| !v.is_str()) {
+            return Err("invalid_config");
+        }
+    }
+    if let Some(providers) = config.get("model_providers") {
+        let providers = providers.as_table().ok_or("invalid_config")?;
+        for table in providers.values() {
+            let table = table.as_table().ok_or("invalid_config")?;
+            for key in [
+                "name",
+                "base_url",
+                "wire_api",
+                "env_key",
+                "experimental_bearer_token",
+            ] {
+                if table.get(key).is_some_and(|v| !v.is_str()) {
+                    return Err("invalid_config");
+                }
+            }
+        }
+    }
+    provider.settings_config["config"] = json!(text);
+    let settings = provider
+        .settings_config
+        .as_object_mut()
+        .ok_or("invalid_config")?;
+    settings.remove("base_url");
+    settings.remove("baseURL");
+    // TOML headers edited here must also replace the proxy metadata projection.
+    if let Some(overrides) = provider
+        .meta
+        .as_mut()
+        .and_then(|m| m.local_proxy_request_overrides.as_mut())
+    {
+        overrides.headers.clear();
+    }
+    let advanced = read_advanced(provider)?;
+    validate_advanced(&advanced)?;
+    apply_advanced(provider, &advanced)?;
+    Ok(())
+}
+
+pub(super) fn edit(provider: Provider, params: &Value) -> Result<Provider> {
+    edit_draft(provider, params, false)
+}
+
+pub(super) fn edit_draft(mut provider: Provider, params: &Value, draft: bool) -> Result<Provider> {
+    if let Some(text) = params.get("configToml") {
+        replace_config(&mut provider, text.as_str().ok_or("invalid_params")?)?;
+    }
     let name = params["name"].as_str().ok_or("invalid_params")?;
     let kind = params["kind"].as_str().ok_or("invalid_params")?;
     let model = params["model"].as_str().ok_or("invalid_params")?;
-    if name.trim().is_empty()
+    if (!draft && name.trim().is_empty())
         || name.len() > 256
         || model.len() > 256
         || model.chars().any(char::is_control)
-        || (kind != "chatgpt" && model.trim().is_empty())
+        || (!draft && kind != "chatgpt" && model.trim().is_empty())
     {
         return Err("invalid_params");
     }
@@ -343,6 +431,20 @@ pub(super) fn edit(mut provider: Provider, params: &Value) -> Result<Provider> {
         .parse::<toml_edit::DocumentMut>()
         .map_err(|_| "invalid_config")?;
     document["model"] = toml_edit::value(model);
+    // Omitted fields retain native values, including non-1M context windows.
+    // Null is an explicit deletion, as when CC's 1M toggle is turned off.
+    for (flat, native) in [
+        ("modelContextWindow", "model_context_window"),
+        ("autoCompactTokenLimit", "model_auto_compact_token_limit"),
+    ] {
+        if let Some(value) = advanced.get(flat) {
+            if value.is_null() {
+                document.remove(native);
+            } else {
+                document[native] = toml_edit::value(value.as_i64().ok_or("invalid_params")?);
+            }
+        }
+    }
     let meta = provider.meta.get_or_insert_with(Default::default);
     meta.api_format = Some(format.to_string());
     if let Some(enabled) = params.get("commonConfigEnabled") {
@@ -354,6 +456,7 @@ pub(super) fn edit(mut provider: Provider, params: &Value) -> Result<Provider> {
         let id = params["accountId"]
             .as_str()
             .filter(|s| !s.is_empty())
+            .or(if draft { Some("") } else { None })
             .ok_or("account_not_found")?;
         meta.auth_binding = Some(crate::provider::AuthBinding {
             source: crate::provider::AuthBindingSource::ManagedAccount,
@@ -380,19 +483,21 @@ pub(super) fn edit(mut provider: Provider, params: &Value) -> Result<Provider> {
         } else {
             requested_base
         };
-        let url = reqwest::Url::parse(base).map_err(|_| "invalid_base_url")?;
-        if !matches!(url.scheme(), "http" | "https")
-            || url.host_str().is_none()
-            || !url.username().is_empty()
-            || url.password().is_some()
-            || url.fragment().is_some()
-        {
-            return Err("invalid_base_url");
-        }
-        if kind == "official_api"
-            && (url.scheme() != "https" || url.host_str() != Some("api.openai.com"))
-        {
-            return Err("invalid_base_url");
+        if !draft || !base.is_empty() {
+            let url = reqwest::Url::parse(base).map_err(|_| "invalid_base_url")?;
+            if !matches!(url.scheme(), "http" | "https")
+                || url.host_str().is_none()
+                || !url.username().is_empty()
+                || url.password().is_some()
+                || url.fragment().is_some()
+            {
+                return Err("invalid_base_url");
+            }
+            if kind == "official_api"
+                && (url.scheme() != "https" || url.host_str() != Some("api.openai.com"))
+            {
+                return Err("invalid_base_url");
+            }
         }
         meta.auth_binding = None;
         meta.provider_type = None;
@@ -421,7 +526,18 @@ pub(super) fn edit(mut provider: Provider, params: &Value) -> Result<Provider> {
         let preserve_auth_source = table.contains_key("base_url")
             && params["apiKey"].as_str().is_none_or(|key| key.is_empty())
             && params["clearApiKey"] != true;
-        table.insert("name", toml_edit::value(name));
+        let remote_compaction = advanced
+            .get("remoteCompaction")
+            .and_then(Value::as_bool)
+            .unwrap_or(previous_advanced["remoteCompaction"] == true);
+        let native_name = if crate::codex_config::is_custom_codex_model_provider_id(&source)
+            && remote_compaction
+        {
+            "OpenAI"
+        } else {
+            name
+        };
+        table.insert("name", toml_edit::value(native_name));
         let base = if advanced["isFullUrl"] == true && format == "openai_responses" {
             base.strip_suffix("/responses").ok_or("invalid_base_url")?
         } else {
@@ -572,10 +688,18 @@ pub(super) fn validate_advanced(value: &Value) -> Result<()> {
     if !value.is_object() || value.to_string().len() > 65536 {
         return Err("invalid_params");
     }
-    for key in ["isFullUrl", "impersonateClaudeCode"] {
+    for key in ["isFullUrl", "impersonateClaudeCode", "remoteCompaction"] {
         if value
             .get(key)
             .is_some_and(|v| !v.is_null() && !v.is_boolean())
+        {
+            return Err("invalid_params");
+        }
+    }
+    for key in ["modelContextWindow", "autoCompactTokenLimit"] {
+        if value
+            .get(key)
+            .is_some_and(|v| !v.is_null() && v.as_i64().is_none_or(|n| n <= 0))
         {
             return Err("invalid_params");
         }
