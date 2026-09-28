@@ -60,6 +60,26 @@ pub(super) fn version(stored: &Provider, edited: &Provider) -> String {
     hash(&json!({"stored":stored,"edited":edited}))
 }
 
+// Only retire our own catalog projection. External catalog files remain user-owned.
+pub(super) fn clear_chatgpt_catalog(provider: &mut Provider) -> Result<bool> {
+    if kind(provider)? != "chatgpt" {
+        return Ok(false);
+    }
+    let config = provider.settings_config["config"].as_str().unwrap_or("");
+    let cleaned = crate::codex_config::set_codex_model_catalog_json_field(config, None)
+        .map_err(|_| "invalid_config")?;
+    let changed = cleaned != config || provider.settings_config.get("modelCatalog").is_some();
+    if changed {
+        provider
+            .settings_config
+            .as_object_mut()
+            .ok_or("invalid_provider")?
+            .remove("modelCatalog");
+        provider.settings_config["config"] = json!(cleaned);
+    }
+    Ok(changed)
+}
+
 pub(super) fn kind(provider: &Provider) -> Result<&'static str> {
     let (base, _) = provider.resolve_usage_credentials(&AppType::Codex);
     if provider.is_codex_oauth()
@@ -451,7 +471,9 @@ pub(super) fn edit(mut provider: Provider, params: &Value) -> Result<Provider> {
     }
     provider.settings_config["config"] = json!(document.to_string());
     apply_advanced(&mut provider, &advanced)?;
-    if let Some(models) = params.get("models") {
+    if kind == "chatgpt" {
+        clear_chatgpt_catalog(&mut provider)?;
+    } else if let Some(models) = params.get("models") {
         gui_catalog::apply_models(&mut provider, models.as_array().ok_or("invalid_models")?)?;
     }
     Ok(provider)
@@ -508,6 +530,30 @@ mod tests {
             .as_object()
             .unwrap()
             .is_empty());
+    }
+    #[test]
+    fn account_edit_retires_only_owned_catalog_and_ignores_submitted_models() {
+        for pointer in ["cc-switch-model-catalog.json", "external-catalog.json"] {
+            let mut original = provider();
+            original.settings_config["modelCatalog"] = json!({"models":[{"model":"wrong"}]});
+            original.settings_config["config"] =
+                json!(format!("model='chosen'\nmodel_catalog_json='{pointer}'\n"));
+            let result = edit(
+                original,
+                &json!({"name":"Account","kind":"chatgpt","model":"chosen",
+                "accountId":"fake-account","models":[{"model":"wrong","reasoningLevels":["low"]}]}),
+            )
+            .unwrap();
+            assert!(result.settings_config.get("modelCatalog").is_none());
+            let config = config(&result).unwrap();
+            assert_eq!(config["model"].as_str(), Some("chosen"));
+            assert_eq!(
+                config
+                    .get("model_catalog_json")
+                    .and_then(toml::Value::as_str),
+                (pointer == "external-catalog.json").then_some(pointer)
+            );
+        }
     }
     #[test]
     fn headers_are_masked_even_for_unfamiliar_secret_names_and_hashes_are_order_independent() {

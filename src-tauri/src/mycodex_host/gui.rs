@@ -264,7 +264,7 @@ pub(super) fn handle(host: &Host, method: &str, params: &Value) -> Result<Value>
                 }
             }
             auto_capture::before_write(state)?;
-            let (stored, edited) = selected(host, params, true)?;
+            let (stored, mut edited) = selected(host, params, true)?;
             if params["expectedFingerprint"].as_str() != Some(fingerprint(host)?.as_str()) {
                 return Err("config_conflict");
             }
@@ -284,6 +284,10 @@ pub(super) fn handle(host: &Host, method: &str, params: &Value) -> Result<Value>
             }
             lifecycle::capture_current_common(state)?;
             lifecycle::prepare(state, &edited)?;
+            if form::clear_chatgpt_catalog(&mut edited)? {
+                ProviderService::update(state, AppType::Codex, None, edited)
+                    .map_err(|_| "operation_unknown")?;
+            }
             let result = ProviderService::switch(state, AppType::Codex, &stored.id);
             if result.is_err() {
                 lifecycle::stop_listener(state).map_err(|_| "operation_unknown")?;

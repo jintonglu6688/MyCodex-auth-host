@@ -897,3 +897,45 @@ fn gui_routed_switches_capture_live_tools_before_backup_restore_and_restart() {
         assert!(!common.contains(forbidden));
     }
 }
+
+#[test]
+fn chatgpt_catalog_repair_on_apply_preserves_live_auth_and_stops_discovery() {
+    let mut gui = Gui::new();
+    external_account(&gui, "alice", "team", "model-a");
+    gui.start();
+    let listed = gui.ok("gui/provider/list", json!({}));
+    let id = listed["currentProviderId"].as_str().unwrap();
+    let auth = std::fs::read(gui.root.path().join("codex/auth.json")).unwrap();
+    // Seed the legacy persisted shape through the native API used by older hosts.
+    gui.ok(
+        "provider/update",
+        json!({"provider": {
+            "id":id,"name":"Legacy account","category":"official",
+            "meta":{"providerType":"codex_oauth","authBinding":{"source":"managed_account",
+                "authProvider":"codex_oauth","accountId":listed["providers"][0]["accountId"]}},
+            "settingsConfig":{"auth":{},
+                "config":"model='model-a'\n","modelCatalog":{"models":[{"model":"wrong-model"}]}}
+        }}),
+    );
+    assert!(gui.config().contains("model_catalog_json"));
+    let before = gui.config();
+    gui.ok("gui/provider/list", json!({}));
+    assert_eq!(gui.config(), before, "Reading must not rewrite live files");
+    let rejected = gui.call("gui/model/fetch", json!({"kind":"chatgpt"}));
+    assert_eq!(rejected["error"]["message"], "invalid_params");
+    switch_gui(&gui, id, "repair");
+    assert!(!gui.config().contains("model_catalog_json"));
+    let after_auth: Value =
+        serde_json::from_slice(&std::fs::read(gui.root.path().join("codex/auth.json")).unwrap())
+            .unwrap();
+    assert_eq!(
+        after_auth["tokens"],
+        serde_json::from_slice::<Value>(&auth).unwrap()["tokens"]
+    );
+    let repaired = gui.ok("gui/provider/get", json!({"providerId":id}));
+    assert_eq!(repaired["models"], json!([]));
+    assert_eq!(repaired["model"], "model-a");
+    gui.stop();
+    gui.start();
+    assert!(!gui.config().contains("model_catalog_json"));
+}

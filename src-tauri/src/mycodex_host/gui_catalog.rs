@@ -273,29 +273,7 @@ pub(super) fn fetch_models(state: &AppState, params: &Value) -> Result<Value> {
 
 async fn fetch(state: &AppState, params: &Value) -> Result<Value> {
     let kind = params["kind"].as_str().ok_or("invalid_params")?;
-    let models = if kind == "chatgpt" {
-        if params.get("apiKey").is_some_and(|v| !v.is_null())
-            || params["baseUrl"].as_str().is_some_and(|s| !s.is_empty())
-        {
-            return Err("invalid_params");
-        }
-        let id = params["accountId"]
-            .as_str()
-            .filter(|s| !s.is_empty())
-            .ok_or("account_not_found")?;
-        let manager = &state.codex_oauth_manager;
-        let token = manager
-            .get_valid_token_for_account(id)
-            .await
-            .map_err(|_| "reauthentication_required")?;
-        let account = manager
-            .chatgpt_account_id_for_account(id)
-            .await
-            .map_err(|_| "account_not_found")?;
-        crate::services::codex_oauth_models::fetch_models_with_token(&token, &account)
-            .await
-            .map_err(|_| "model_fetch_failed")?
-    } else {
+    let models = {
         if !matches!(
             kind,
             "official_api" | "responses" | "chat_completions" | "anthropic"
