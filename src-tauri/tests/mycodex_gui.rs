@@ -113,6 +113,56 @@ fn save(id: &str) -> Value {
 }
 
 #[test]
+fn browser_login_is_restorable_idempotent_and_cancellable_without_changing_live_auth() {
+    let mut gui = Gui::new();
+    gui.start();
+    let snapshot = gui.ok("gui/account/list", json!({}));
+    assert_eq!(snapshot["browserLoginAvailable"], cfg!(windows));
+    let params = json!({"loginId":"browser-test","method":"browser"});
+    if !cfg!(windows) {
+        assert_eq!(
+            gui.call("gui/account/login/start", params)["error"]["message"],
+            "unsupported_target"
+        );
+        return;
+    }
+    let started = gui.ok("gui/account/login/start", params.clone());
+    assert_eq!(started["status"], "pending");
+    assert_eq!(started["method"], "browser");
+    assert_eq!(started["userCode"], "");
+    assert!(started["verificationUri"]
+        .as_str()
+        .unwrap()
+        .starts_with("https://auth.openai.com/oauth/authorize?"));
+    assert_eq!(gui.ok("gui/account/login/start", params), started);
+    assert_eq!(
+        gui.ok("gui/account/list", json!({}))["activeLogin"],
+        started
+    );
+    assert_eq!(
+        gui.call(
+            "gui/account/login/start",
+            json!({"loginId":"browser-test","method":"device"})
+        )["error"]["message"],
+        "login_id_conflict"
+    );
+    let cancelled = gui.ok(
+        "gui/account/login/cancel",
+        json!({"loginId":"browser-test"}),
+    );
+    assert_eq!(cancelled["status"], "cancelled");
+    assert_eq!(cancelled["verificationUri"], "");
+    assert_eq!(
+        gui.ok("gui/account/login/get", json!({"loginId":"browser-test"})),
+        cancelled
+    );
+    let snapshot = gui.ok("gui/account/list", json!({}));
+    assert!(snapshot["activeLogin"].is_null());
+    assert!(snapshot["accounts"].as_array().unwrap().is_empty());
+    assert!(!gui.root.path().join("codex/auth.json").exists());
+}
+
+#[test]
 fn context_settings_survive_save_restart_and_disable_with_or_without_conversion() {
     for kind in ["responses", "chat_completions", "anthropic"] {
         let mut gui = Gui::new();

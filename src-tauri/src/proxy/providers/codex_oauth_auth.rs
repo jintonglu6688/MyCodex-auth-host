@@ -35,6 +35,9 @@ use super::copilot_auth::{GitHubAccount, GitHubDeviceCodeResponse};
 #[path = "codex_oauth_import.rs"]
 mod existing_login;
 pub(crate) use existing_login::existing_login_identity;
+#[path = "codex_oauth_browser.rs"]
+mod browser_login;
+pub(crate) use browser_login::BrowserLogin;
 
 /// OpenAI OAuth 客户端 ID（OpenCode 使用，与官方 Codex CLI 相同）
 const CODEX_CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
@@ -458,30 +461,8 @@ impl CodexOAuthManager {
         target_account_id: Option<&str>,
     ) -> Result<GitHubDeviceCodeResponse, CodexOAuthError> {
         log::info!("[CodexOAuth] 启动 Device Code 流程");
-        let login_epoch = self.login_epoch.load(Ordering::Acquire);
-        let target_account_id = target_account_id
-            .map(str::trim)
-            .filter(|account_id| !account_id.is_empty())
-            .map(str::to_string);
-        let target_generation = if let Some(account_id) = target_account_id.as_deref() {
-            let accounts = self.accounts.read().await;
-            if !accounts.contains_key(account_id) {
-                return Err(CodexOAuthError::AccountNotFound(account_id.to_string()));
-            }
-            drop(accounts);
-            let generation = self
-                .next_target_login_generation
-                .fetch_add(1, Ordering::AcqRel)
-                .wrapping_add(1);
-            let mut generations = self.target_login_generations.write().await;
-            generations
-                .entry(account_id.to_string())
-                .and_modify(|current| *current = (*current).max(generation))
-                .or_insert(generation);
-            Some(generation)
-        } else {
-            None
-        };
+        let (login_epoch, target_account_id, target_generation) =
+            self.begin_login(target_account_id).await?;
 
         let response = crate::proxy::http_client::get()
             .post(DEVICE_AUTH_USERCODE_URL)
@@ -531,6 +512,38 @@ impl CodexOAuthManager {
             expires_in,
             interval,
         })
+    }
+
+    async fn begin_login(
+        &self,
+        target_account_id: Option<&str>,
+    ) -> Result<(u64, Option<String>, Option<u64>), CodexOAuthError> {
+        let login_epoch = self.login_epoch.load(Ordering::Acquire);
+        let target_account_id = target_account_id
+            .map(str::trim)
+            .filter(|account_id| !account_id.is_empty())
+            .map(str::to_string);
+        let target_generation = if let Some(account_id) = target_account_id.as_deref() {
+            let accounts = self.accounts.read().await;
+            if !accounts.contains_key(account_id) {
+                return Err(CodexOAuthError::AccountNotFound(account_id.to_string()));
+            }
+            drop(accounts);
+            let generation = self
+                .next_target_login_generation
+                .fetch_add(1, Ordering::AcqRel)
+                .wrapping_add(1);
+            let mut generations = self.target_login_generations.write().await;
+            generations
+                .entry(account_id.to_string())
+                .and_modify(|current| *current = (*current).max(generation))
+                .or_insert(generation);
+            Some(generation)
+        } else {
+            None
+        };
+
+        Ok((login_epoch, target_account_id, target_generation))
     }
 
     async fn register_pending_device_code(
@@ -641,9 +654,29 @@ impl CodexOAuthManager {
 
         // 用 authorization_code + code_verifier 换 token
         let tokens = self
-            .exchange_code_for_tokens(&success.authorization_code, &success.code_verifier)
+            .exchange_code_for_tokens(
+                &success.authorization_code,
+                &success.code_verifier,
+                DEVICE_REDIRECT_URI,
+            )
             .await?;
 
+        self.commit_login_tokens(tokens, device_code, &entry, before_commit)
+            .await
+            .map(Some)
+    }
+
+    async fn commit_login_tokens<BeforeCommit, CommitFuture, CommitGuard>(
+        &self,
+        tokens: OAuthTokenResponse,
+        device_code: &str,
+        entry: &PendingDeviceCode,
+        before_commit: BeforeCommit,
+    ) -> Result<GitHubAccount, CodexOAuthError>
+    where
+        BeforeCommit: FnOnce() -> CommitFuture,
+        CommitFuture: std::future::Future<Output = CommitGuard>,
+    {
         let refresh_token = tokens.refresh_token.clone().ok_or_else(|| {
             CodexOAuthError::TokenFetchFailed("响应缺少 refresh_token".to_string())
         })?;
@@ -694,7 +727,7 @@ impl CodexOAuthManager {
             )
             .await?;
 
-        Ok(Some(account))
+        Ok(account)
     }
 
     /// 用 authorization_code + code_verifier 换取 tokens
@@ -702,6 +735,7 @@ impl CodexOAuthManager {
         &self,
         code: &str,
         code_verifier: &str,
+        redirect_uri: &str,
     ) -> Result<OAuthTokenResponse, CodexOAuthError> {
         let response = crate::proxy::http_client::get()
             .post(OAUTH_TOKEN_URL)
@@ -711,7 +745,7 @@ impl CodexOAuthManager {
             .form(&[
                 ("grant_type", "authorization_code"),
                 ("code", code),
-                ("redirect_uri", DEVICE_REDIRECT_URI),
+                ("redirect_uri", redirect_uri),
                 ("client_id", CODEX_CLIENT_ID),
                 ("code_verifier", code_verifier),
             ])

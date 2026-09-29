@@ -67,12 +67,15 @@ pub(super) fn handle(state: &AppState, method: &str, params: &Value) -> Result<V
     }
 }
 
-fn summary(account: &GitHubAccount) -> Value {
+pub(super) fn summary(account: &GitHubAccount) -> Value {
     json!({"id":account.id,"login":account.login,"reauthRequired":account.reauth_required})
 }
 
-fn auth_error(error: CodexOAuthError) -> &'static str {
+pub(super) fn auth_error(error: CodexOAuthError) -> &'static str {
     match error {
+        CodexOAuthError::IoError(ref message) if message == "browser_callback_unavailable" => {
+            "browser_callback_unavailable"
+        }
         CodexOAuthError::AccessDenied => "login_denied",
         CodexOAuthError::ExpiredToken => "login_expired",
         CodexOAuthError::DuplicateAccount => "account_already_exists",
