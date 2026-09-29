@@ -33,7 +33,7 @@ def main():
             (package / name).chmod(0o755)
             for filename in ("LICENSE", "RUNTIME.md", "dependencies.txt"):
                 (package / filename).write_text("fixture", encoding="utf-8")
-            manifest = dict(schemaVersion=1, hostVersion="0.2.2", protocolVersion=2,
+            manifest = dict(schemaVersion=1, hostVersion="0.2.3", protocolVersion=2,
                             upstreamRevision=release.UPSTREAM, sourceRevision=revision,
                             sourceDirty=False, target=target, executable=name,
                             sha256=release.digest(package / name))
@@ -50,7 +50,7 @@ def main():
                     assert json.load(bundle.extractfile(release.MANIFEST)) == manifest
             rejects(lambda: release.validate(dict(manifest, sourceDirty=True), target, revision))
             rejects(lambda: release.validate(dict(manifest, sourceRevision="b" * 40), target, revision))
-        index = release.assemble(output, revision, "auth-core-v0.2.2")
+        index = release.assemble(output, revision, "auth-core-v0.2.3")
         assert len(index["assets"]) == 4
         assert len((output / "SHA256SUMS.txt").read_text().splitlines()) == 9
         rejects(lambda: release.assemble(output, revision, "auth-core-v9.0.0"))

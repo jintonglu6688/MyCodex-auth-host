@@ -39,7 +39,7 @@ def native_target():
 
 
 def validate(identity):
-    require(identity.get("protocolVersion") == 2 and identity.get("hostVersion") == "0.2.2"
+    require(identity.get("protocolVersion") == 2 and identity.get("hostVersion") == "0.2.3"
             and identity.get("upstreamRevision") == UPSTREAM
             and re.fullmatch(r"[0-9a-f]{40}", identity.get("sourceRevision", ""))
             and type(identity.get("sourceDirty")) is bool
