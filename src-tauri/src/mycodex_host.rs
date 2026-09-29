@@ -21,6 +21,7 @@ mod identity;
 mod ipc;
 pub(crate) mod lifecycle;
 mod paths;
+mod runtime_config;
 mod security;
 
 type Result<T> = std::result::Result<T, &'static str>;
@@ -238,6 +239,7 @@ fn handle(host: &Host, request: &Request, resident: bool) -> Result<Value> {
                     "guiProviderManagement",
                     "guiMcpManagement",
                     "globalAuthCapture",
+                    "runtimeConfigPreparation",
                 ]
             } else {
                 vec!["codexNativeServices"]
@@ -245,6 +247,7 @@ fn handle(host: &Host, request: &Request, resident: bool) -> Result<Value> {
             value["route"] = lifecycle::status(state)?;
             Ok(value)
         }
+        "runtime/prepare" if resident => runtime_config::prepare(),
         "provider/list" => {
             let captured = auto_capture::read(state)?;
             let providers = ProviderService::list(state, AppType::Codex).map_err(service_error)?;

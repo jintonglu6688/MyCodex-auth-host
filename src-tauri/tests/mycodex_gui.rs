@@ -113,6 +113,86 @@ fn save(id: &str) -> Value {
 }
 
 #[test]
+fn runtime_prepare_cleans_existing_fields_without_switching_accounts_or_losing_tools() {
+    for routed in [false, true] {
+        let mut gui = Gui::new();
+        external_api(&gui, "synthetic-secret-before", "model-a");
+        gui.start();
+        let mut provider = save("prepare");
+        if routed {
+            provider["kind"] = json!("chat_completions");
+        }
+        gui.ok("gui/provider/save", provider);
+        switch_gui(&gui, "prepare", "prepare-apply");
+        gui.stop();
+        gui.start();
+        let auth = std::fs::read(gui.root.path().join("codex/auth.json")).ok();
+        let original = format!("disable_response_storage=true\n{}\n[mcp_servers.legacy]\ntype='stdio'\ncommand='synthetic-tool'\nargs=['--keep']\nenv={{type='keep',KEY='synthetic-secret'}}\n", gui.config());
+        std::fs::write(gui.root.path().join("codex/config.toml"), &original).unwrap();
+        let before = gui.ok("gui/provider/list", json!({}));
+        assert!(gui.ok("status", json!({}))["capabilities"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("runtimeConfigPreparation")));
+        assert_eq!(gui.ok("runtime/prepare", json!({}))["changed"], true);
+        let cleaned = gui.config();
+        let mut expected: toml::Value = original.parse().unwrap();
+        expected
+            .as_table_mut()
+            .unwrap()
+            .remove("disable_response_storage");
+        expected["mcp_servers"]["legacy"]
+            .as_table_mut()
+            .unwrap()
+            .remove("type");
+        assert_eq!(cleaned.parse::<toml::Value>().unwrap(), expected);
+        assert_eq!(
+            std::fs::read(gui.root.path().join("codex/auth.json")).ok(),
+            auth
+        );
+        let after = gui.ok("gui/provider/list", json!({}));
+        assert_eq!(after["currentProviderId"], before["currentProviderId"]);
+        assert_eq!(
+            after["providers"].as_array().unwrap().len(),
+            before["providers"].as_array().unwrap().len()
+        );
+        assert_eq!(after["route"], before["route"]);
+        assert_eq!(gui.ok("runtime/prepare", json!({}))["changed"], false);
+        assert_eq!(gui.config(), cleaned);
+        let backups: Vec<_> = std::fs::read_dir(gui.root.path().join("store"))
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .filter(|p| {
+                p.file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .starts_with("config-before-compat-")
+            })
+            .collect();
+        assert_eq!(backups.len(), 1);
+        assert_eq!(std::fs::read_to_string(&backups[0]).unwrap(), original);
+        // A different client can reintroduce old fields while the host stays resident.
+        std::fs::write(gui.root.path().join("codex/config.toml"), &original).unwrap();
+        assert_eq!(gui.ok("runtime/prepare", json!({}))["changed"], true);
+        assert_eq!(gui.config(), cleaned);
+    }
+}
+
+#[test]
+fn runtime_prepare_leaves_missing_or_invalid_config_untouched() {
+    let mut gui = Gui::new();
+    gui.start();
+    assert_eq!(gui.ok("runtime/prepare", json!({}))["changed"], false);
+    assert!(!gui.root.path().join("codex/config.toml").exists());
+    std::fs::write(gui.root.path().join("codex/config.toml"), "invalid=[").unwrap();
+    assert_eq!(
+        gui.call("runtime/prepare", json!({}))["error"]["message"],
+        "invalid_live_config"
+    );
+    assert_eq!(gui.config(), "invalid=[");
+}
+
+#[test]
 fn browser_login_is_restorable_idempotent_and_cancellable_without_changing_live_auth() {
     let mut gui = Gui::new();
     gui.start();
