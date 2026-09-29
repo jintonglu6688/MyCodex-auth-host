@@ -303,8 +303,7 @@ pub fn sync_enabled_to_codex(config: &MultiAppConfig) -> Result<(), AppError> {
 
     // 6) 写回（仅改 TOML，不触碰 auth.json）；toml_edit 会尽量保留未改区域的注释/空白/顺序
     let new_text = doc.to_string();
-    let path = crate::codex_config::get_codex_config_path();
-    crate::config::write_text_file(&path, &new_text)?;
+    crate::codex_config::write_codex_live_config_atomic(Some(&new_text))?;
     Ok(())
 }
 
@@ -418,7 +417,7 @@ pub fn sync_single_server_to_codex(
 
     // 写回文件
     let new_text = doc.to_string();
-    crate::config::write_text_file(&config_path, &new_text)?;
+    crate::codex_config::write_codex_live_config_atomic(Some(&new_text))?;
 
     Ok(())
 }
@@ -451,7 +450,7 @@ pub fn remove_server_from_codex(id: &str) -> Result<(), AppError> {
 
     // 写回文件
     let new_text = doc.to_string();
-    crate::config::write_text_file(&config_path, &new_text)?;
+    crate::codex_config::write_codex_live_config_atomic(Some(&new_text))?;
 
     Ok(())
 }
@@ -506,7 +505,7 @@ pub(super) fn json_server_to_toml_table(spec: &Value) -> Result<toml_edit::Table
 
     let mut t = Table::new();
     let typ = spec.get("type").and_then(|v| v.as_str()).unwrap_or("stdio");
-    t["type"] = toml_edit::value(typ);
+    // CC uses type internally; Codex infers transport from command/url.
 
     // 定义核心字段（已在下方处理，跳过通用转换）
     let core_fields = match typ {
@@ -624,6 +623,34 @@ pub(super) fn json_server_to_toml_table(spec: &Value) -> Result<toml_edit::Table
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn codex_projection_omits_internal_transport_type() {
+        for spec in [
+            json!({"type":"stdio","command":"test","env":{"type":"keep"}}),
+            json!({"type":"http","url":"https://example.invalid/mcp","headers":{"Authorization":"synthetic"}}),
+            json!({"type":"sse","url":"https://example.invalid/sse"}),
+        ] {
+            let table = json_server_to_toml_table(&spec).unwrap();
+            assert!(!table.contains_key("type"));
+            assert!(
+                spec.get("type").is_some(),
+                "archive transport must remain unchanged"
+            );
+            if spec["type"] == "stdio" {
+                assert_eq!(table["command"].as_str(), Some("test"));
+                assert_eq!(table["env"]["type"].as_str(), Some("keep"));
+            } else {
+                assert_eq!(table["url"].as_str(), spec["url"].as_str());
+                if spec["type"] == "http" {
+                    assert_eq!(
+                        table["http_headers"]["Authorization"].as_str(),
+                        Some("synthetic")
+                    );
+                }
+            }
+        }
+    }
 
     #[test]
     fn upsert_normalizes_non_table_mcp_servers_without_panicking() {

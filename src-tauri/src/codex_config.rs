@@ -15,6 +15,10 @@ use std::fs;
 use std::process::{Command, Stdio};
 use toml_edit::DocumentMut;
 
+#[path = "codex_config_compat.rs"]
+mod compatibility;
+pub(crate) use compatibility::normalize_live_config;
+
 pub const CC_SWITCH_CODEX_MODEL_PROVIDER_ID: &str = "custom";
 /// Temporary model-provider id used while the built-in `codex-official`
 /// provider is routed through CC Switch.  A dedicated id is an ownership
@@ -1059,6 +1063,8 @@ pub fn write_codex_live_atomic(
         toml::from_str::<toml::Table>(&cfg_text).map_err(|e| AppError::toml(&config_path, e))?;
     }
 
+    let cfg_text = normalize_live_config(&cfg_text)?;
+
     // 第一步：写 auth.json
     write_json_file(&auth_path, auth)?;
 
@@ -1136,6 +1142,7 @@ pub fn write_codex_live_config_atomic(config_text_opt: Option<&str>) -> Result<(
         toml::from_str::<toml::Table>(&cfg_text).map_err(|e| AppError::toml(&config_path, e))?;
     }
 
+    let cfg_text = normalize_live_config(&cfg_text)?;
     write_text_file(&config_path, &cfg_text)
 }
 

@@ -561,6 +561,9 @@ fn gui_mcp_native_archive_survives_switches_and_requires_explicit_import_and_fre
     switch_gui(&gui, "mcp-b", "mcp-switch-b");
     switch_gui(&gui, "mcp-a", "mcp-switch-a");
     let live: toml::Value = toml::from_str(&gui.config()).unwrap();
+    for server in ["local", "remote"] {
+        assert!(live["mcp_servers"][server].get("type").is_none());
+    }
     assert_eq!(
         live["mcp_servers"]["remote"]["extension"]["nested"][0]["keep"].as_bool(),
         Some(true)
@@ -1134,7 +1137,7 @@ fn common_editor_uses_native_merge_clear_and_version_checks_with_and_without_rou
             "invalid_config"
         );
         assert_eq!(before, gui.config());
-        let update = json!({"text":"model_reasoning_effort='high'\nmodel_context_window=1000000\n", "expectedVersion":original["version"]});
+        let update = json!({"text":"disable_response_storage=true\nmodel_reasoning_effort='high'\nmodel_context_window=1000000\n", "expectedVersion":original["version"]});
         assert_eq!(
             gui.ok("gui/config/common/save", update.clone())["globalApplied"],
             true
@@ -1145,6 +1148,7 @@ fn common_editor_uses_native_merge_clear_and_version_checks_with_and_without_rou
         );
         let live: toml::Value = gui.config().parse().unwrap();
         assert_eq!(live["model_context_window"].as_integer(), Some(1000000));
+        assert!(live.get("disable_response_storage").is_none());
         gui.stop();
         gui.start();
         let current = gui.ok("gui/config/common/get", json!({}));
@@ -1225,6 +1229,27 @@ fn known_chatgpt_variants_do_not_trigger_another_auto_capture() {
             if with_copy { 3 } else { 2 }
         );
     }
+}
+
+#[test]
+fn ignored_legacy_fields_do_not_break_exact_provider_matching() {
+    let mut gui = Gui::new();
+    external_account(&gui, "legacy-match", "team", "model-a");
+    gui.start();
+    let before = gui.ok("gui/provider/list", json!({}));
+    std::fs::write(
+        gui.root.path().join("codex/config.toml"),
+        format!("disable_response_storage=true\n{}", gui.config()),
+    )
+    .unwrap();
+    let after = gui.ok("gui/provider/list", json!({}));
+    assert_eq!(after["currentProviderId"], before["currentProviderId"]);
+    assert_eq!(after["providers"].as_array().unwrap().len(), 1);
+    let diagnostics =
+        std::fs::read_to_string(gui.root.path().join("store/auto-capture.jsonl")).unwrap();
+    let last: Value = serde_json::from_str(diagnostics.lines().last().unwrap()).unwrap();
+    assert_eq!(last["capture"]["exactCount"], 1);
+    assert_eq!(last["capture"]["branch"], "exact_previous");
 }
 
 #[test]

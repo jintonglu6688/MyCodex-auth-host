@@ -223,6 +223,8 @@ pub(super) fn same_settings(state: &AppState, provider: &Provider, live: &Value)
             None,
         )
         .map_err(service_error)?;
+        // Ignored legacy fields cannot distinguish otherwise identical providers.
+        let text = codex::normalize_live_config(&text).map_err(service_error)?;
         let mut config: toml::Value = toml::from_str(&text).map_err(|_| "invalid_config")?;
         if let Some(providers) = config
             .get_mut("model_providers")
