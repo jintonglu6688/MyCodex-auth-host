@@ -194,6 +194,15 @@
 - **集成测试**：需要真实宿主的显式测试改用 `gui/*` 接口（保存、应用）代替已删除的原生 `provider/*` 方法；插件/技能测试改为断言全局设置在每个供应商下都保留；往返测试改为断言 v4 不回填 live 关键字段。
 - **未做**：三方冲突编辑器（见第二阶段）；Windows 内置包与远端固定值（标签、哈希、源码提交）随第四阶段发布更新。
 
+## 第四阶段发现：Unix 管理端点被 `/tmp` 清理（0.3.1）
+
+Mac SSH 目标验收时“更新后台”失败，界面只显示通用失败。该问题自 0.2.x 起就存在，和 v4 移植无关：
+
+- Unix 常驻进程把 `management.lock` 和 `management.sock` 放在 `/tmp/mycodex-auth-core-<uid>-<哈希>/`。macOS `tmp_cleaner`（以及 systemd-tmpfiles）会删除几天未访问的文件；常驻数天后端点消失，`rpc` 返回 `backend_unavailable`。
+- 客户端随即启动新的 `serve`：它取得新建的实例锁，先替换 socket，再因数据目录锁仍被旧进程持有而以 `store_busy` 退出，留下无人监听的 socket。旧常驻从此无法查询、更新或停止。
+- 0.3.1 修复：`serve` 先取数据目录锁再动 socket，竞争进程以 `backend_already_running` 退出且不影响常驻；常驻每 10 秒刷新端点文件时间，并在锁或 socket 被删除、替换时自行重建。原生测试 `resident_restores_endpoint_files_removed_from_tmp` 在 macOS 和 Linux 上覆盖该场景。
+- 已陷入此状态的 0.2.x/0.3.0 常驻无法经协议恢复，需要在目标上结束旧的 `mycodex-auth-host` 进程（或重启）后再更新；前端为 `store_busy` 给出这一提示。
+
 ## 主要风险
 
 | 风险 | 应对 |
@@ -215,3 +224,5 @@
 | 2026-10-10 | 第二阶段 | 四平台云构建 run `38024569264`（`e6a1eb99`）：四个平台构建（含原生进程测试）和完整发布校验全部通过；未打标签，发布步骤按设计跳过 |
 | 2026-10-10 | 第三阶段 | 前端适配完成（见“第三阶段实现与决定”）；身份 `upstreamRevision` 改为 v4.0.5。前端 Debug/Release 构建无警告；完整测试 4662 个中只有已记录的既有失败 `MainFormShutdownDiagnosticsTests` 1 个；用本地 0.3.0 包运行需要真实宿主的显式测试 6 个（直连/路由切换、MCP、插件与技能、退出与重启）全部通过；后端原生进程测试 38 个通过 |
 | 2026-10-10 | 第四阶段 | 发布 `auth-core-v0.3.0`（源码 `d8177278`，run `38029582629`），GitHub Release 10 个附件；GitCode 镜像校验通过（镜像脚本改为接受协议 2 和 3）；前端 `port/v4` 固定 0.3.0 的 Windows 包和三个 Unix 包，Dev/Release 构建通过。待维护者本机 Windows 实测；WSL/SSH 升级验收暂缓 |
+| 2026-10-10 | 第四阶段 | 维护者实测：本机 Windows、WSL 通过；Mac SSH 更新失败，定位为 Unix 端点被 `/tmp` 清理（见“第四阶段发现”）。结束 Mac 上失联的旧常驻后升级到 0.3.0 正常 |
+| 2026-10-10 | 第四阶段 | 发布 `auth-core-v0.3.1`（源码 `11733dd7`，分支构建 `38032997732`、发布 run `38034172428`），GitHub Release 10 个附件，GitCode 镜像校验通过；前端 `port/v4` 固定 0.3.1（`b75d37cb`），完整测试只有既有失败 1 个 |
