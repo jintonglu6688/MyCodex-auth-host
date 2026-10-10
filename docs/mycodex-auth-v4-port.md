@@ -211,6 +211,13 @@ Mac SSH 目标验收时“更新后台”失败，界面只显示通用失败。
 - 实测：推理摘要、详细程度、网页搜索在普通、路由、MiMo 之间切换都保留（回归测试 `mycodex_official_settings_survive_provider_switches`）；SudoCode.us 预设自带 `model_verbosity`，切过去会覆盖、切走会删除（上游行为）。
 - 修复（未发布，待下个版本）：适配层 `shadowed_settings` 在供应商覆盖独有字段前记下用户的值（数据目录 `shadowed-settings.json`），切走后若被 v4 删除则按三方写回；被覆盖期间用户改过的值优先，不恢复旧值。回归测试 `exclusive_settings_a_provider_overrides_return_to_the_users_value`。
 
+## 后续：合并上游 v4.0.7（0.3.3）
+
+- 合并 v4.0.6、v4.0.7（`790ed800`），只有 `src-tauri/Cargo.toml` 的 `windows-sys` 功能列表冲突（保留本仓库的 `Win32_Security_Authorization` 和上游新增的 `Win32_Foundation`）；身份 `upstreamRevision` 改为 `790ed8009df809bedaf6c31b5ced05da46bb1f1f`，前端仍把 v4.0.5 基线的 0.3.x 安装识别为可更新。
+- 与本后端相关的上游修复：第三方（转换路由、Copilot）模型目录改用内置模板，不再复制本机 `models_cache.json` 的 gpt-5.5 条目（该条目已带 `tool_mode: code_mode_only`、隐藏标记，并于 2026-10-14 退役）；同一用户的不同 ChatGPT 工作区按用户加工作区区分；顶层 `base_url` 的旧写法归一到 `[model_providers.custom]`；删除托管账号时解绑引用它的供应商（宿主的删除接口调用同一函数，自动生效）。
+- 预设重新导出（上游去掉 Copilot 的代表性 `apiFormat`）。
+- 新增回归测试：`third_party_catalog_does_not_inherit_the_codex_model_cache`（合并前失败：第三方条目继承了 `code_mode_only`）、`workspaces_of_one_user_are_separate_accounts_and_switching_rewrites_auth`（本宿主的托管账号路径合并前后都通过，作为防回归）。
+
 ## 主要风险
 
 | 风险 | 应对 |

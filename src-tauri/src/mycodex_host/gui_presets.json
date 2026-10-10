@@ -1,6 +1,6 @@
 {
   "source": "src/config/codexProviderPresets.ts",
-  "sourceSha256": "450e4425563bbec960755be6f5df13289160575deee0900fcccb1f30e9bc7708",
+  "sourceSha256": "f25fa3d06a34621c1cbf7a379928aff4e1c46f0321e5e1dd25001a80288edab6",
   "presets": [
     {
       "name": "OpenAI Official",
@@ -26,7 +26,6 @@
       "endpointCandidates": [
         "https://api.githubcopilot.com"
       ],
-      "apiFormat": "openai_chat",
       "providerType": "github_copilot",
       "requiresOAuth": true,
       "modelCatalog": [

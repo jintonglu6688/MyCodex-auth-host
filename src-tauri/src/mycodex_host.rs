@@ -27,7 +27,7 @@ mod shadowed_settings;
 
 type Result<T> = std::result::Result<T, &'static str>;
 const MAX_REQUEST: usize = 1_048_576;
-const UPSTREAM: &str = "2db86e94da13365caae55bb08d09295e31500d21";
+const UPSTREAM: &str = "790ed8009df809bedaf6c31b5ced05da46bb1f1f";
 
 pub(crate) struct RuntimePaths {
     pub data_dir: PathBuf,

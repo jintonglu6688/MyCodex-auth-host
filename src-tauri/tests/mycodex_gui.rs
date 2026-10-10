@@ -421,6 +421,69 @@ fn auto_capture_accounts_bind_uuid_and_never_replace_previous_identity() {
 }
 
 #[test]
+fn workspaces_of_one_user_are_separate_accounts_and_switching_rewrites_auth() {
+    let mut gui = Gui::new();
+    external_account(&gui, "alice", "plus-workspace", "model-a");
+    gui.start();
+    let plus = gui.ok("gui/provider/list", json!({}))["currentProviderId"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    external_account(&gui, "alice", "team-workspace", "model-a");
+    let list = gui.ok("gui/provider/list", json!({}));
+    let team = list["currentProviderId"].as_str().unwrap().to_string();
+    assert_eq!(list["providers"].as_array().unwrap().len(), 2, "{list}");
+    assert_ne!(plus, team);
+    let workspace = || {
+        let auth: Value = serde_json::from_slice(
+            &std::fs::read(gui.root.path().join("codex/auth.json")).unwrap(),
+        )
+        .unwrap();
+        auth["tokens"]["account_id"]
+            .as_str()
+            .unwrap_or("")
+            .to_string()
+    };
+    switch_gui(&gui, &plus, "to-plus");
+    assert_eq!(workspace(), "plus-workspace");
+    switch_gui(&gui, &team, "to-team");
+    assert_eq!(workspace(), "team-workspace");
+}
+
+#[test]
+fn third_party_catalog_does_not_inherit_the_codex_model_cache() {
+    let mut gui = Gui::new();
+    // Codex's own cache hides gpt-5.5 and announces its retirement.
+    std::fs::write(
+        gui.root.path().join("codex/models_cache.json"),
+        json!({"client_version":"0.162.1","models":[{"slug":"gpt-5.5","display_name":"GPT-5.5",
+            "visibility":"hide","tool_mode":"code_mode_only",
+            "upgrade":{"model":"gpt-6.1-sol","retirement_at":"2026-10-14T19:00:00Z"}}]})
+        .to_string(),
+    )
+    .unwrap();
+    gui.start();
+    let mut routed = save("routed");
+    routed["kind"] = json!("chat_completions");
+    gui.ok("gui/provider/save", routed);
+    let config: toml::Value = gui.config().parse().unwrap();
+    let catalog = config["model_catalog_json"].as_str().unwrap();
+    let catalog = std::fs::read_to_string(gui.root.path().join("codex").join(catalog))
+        .or_else(|_| std::fs::read_to_string(catalog))
+        .unwrap();
+    let catalog: Value = serde_json::from_str(&catalog).unwrap();
+    let entry = catalog["models"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|model| model["slug"] == "model-a")
+        .unwrap_or_else(|| panic!("{catalog}"));
+    assert_ne!(entry["visibility"], "hide", "{entry}");
+    assert!(entry.get("upgrade").is_none_or(Value::is_null), "{entry}");
+    assert_ne!(entry["tool_mode"], "code_mode_only", "{entry}");
+}
+
+#[test]
 fn auto_capture_unknown_live_keeps_saved_list_and_refuses_stale_edit() {
     let mut gui = Gui::new();
     external_api(&gui, "synthetic-secret-a", "model-a");
