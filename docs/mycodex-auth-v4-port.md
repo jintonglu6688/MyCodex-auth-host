@@ -226,3 +226,4 @@ Mac SSH 目标验收时“更新后台”失败，界面只显示通用失败。
 | 2026-10-10 | 第四阶段 | 发布 `auth-core-v0.3.0`（源码 `d8177278`，run `38029582629`），GitHub Release 10 个附件；GitCode 镜像校验通过（镜像脚本改为接受协议 2 和 3）；前端 `port/v4` 固定 0.3.0 的 Windows 包和三个 Unix 包，Dev/Release 构建通过。待维护者本机 Windows 实测；WSL/SSH 升级验收暂缓 |
 | 2026-10-10 | 第四阶段 | 维护者实测：本机 Windows、WSL 通过；Mac SSH 更新失败，定位为 Unix 端点被 `/tmp` 清理（见“第四阶段发现”）。结束 Mac 上失联的旧常驻后升级到 0.3.0 正常 |
 | 2026-10-10 | 第四阶段 | 发布 `auth-core-v0.3.1`（源码 `11733dd7`，分支构建 `38032997732`、发布 run `38034172428`），GitHub Release 10 个附件，GitCode 镜像校验通过；前端 `port/v4` 固定 0.3.1（`b75d37cb`），完整测试只有既有失败 1 个 |
+| 2026-10-10 | 完成 | 维护者实测 Windows、WSL、Mac SSH 从 0.3.0 升级到 0.3.1 通过；前后端 `port/v4` 快进合并到 `main`；GitHub Latest 设为 `auth-core-v0.3.1` |
