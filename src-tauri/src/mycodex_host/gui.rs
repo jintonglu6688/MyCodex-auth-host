@@ -108,7 +108,7 @@ fn persist(host: &Host, previous: Option<&Provider>, edited: Provider) -> Result
             .db
             .save_provider("codex", &edited)
             .map_err(|_| "save_outcome_unknown")?;
-        lifecycle::activate(state, &edited).map_err(|_| "save_outcome_unknown")?;
+        lifecycle::activate_saved(state, &edited).map_err(|_| "save_outcome_unknown")?;
     } else {
         // A routed host has no direct pointer, so native add would treat any new
         // row as the first provider and write it live. Inactive rows are stored only.

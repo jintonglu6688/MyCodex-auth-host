@@ -34,12 +34,12 @@ pub(super) fn stored(state: &AppState, id: &str) -> Result<Provider> {
 }
 
 // v4 rows own the key fields and global settings stay in the live file. While a
-// provider is in direct use, Codex and MyCodex may change its model and
-// reasoning settings in the live file; the form shows and saves those values
-// without persisting them on read.
+// provider is in use, Codex and MyCodex may change its model and reasoning
+// settings in the live file; the form shows and saves those values. They are
+// stored in the row before switching away (see `session_choices`).
 pub(super) fn snapshot(state: &AppState, provider: &Provider) -> Result<Provider> {
     let mut edited = provider.clone();
-    let Some(live) = super::auto_capture::live_overlay(state, provider).unwrap_or(None) else {
+    let Some(live) = super::session_choices::owned_live(state, provider).unwrap_or(None) else {
         return Ok(edited);
     };
     let Ok(live) = live.parse::<toml_edit::DocumentMut>() else {
@@ -50,21 +50,7 @@ pub(super) fn snapshot(state: &AppState, provider: &Provider) -> Result<Provider
         .unwrap_or("")
         .parse::<toml_edit::DocumentMut>()
         .map_err(|_| "invalid_config")?;
-    for key in [
-        "model",
-        "model_reasoning_effort",
-        "plan_mode_reasoning_effort",
-        "review_model",
-    ] {
-        match live.get(key).and_then(toml_edit::Item::as_value) {
-            Some(value) => row[key] = toml_edit::Item::Value(value.clone()),
-            // A missing model keeps the saved one; other fields follow the live file.
-            None if key != "model" => {
-                row.remove(key);
-            }
-            None => (),
-        }
-    }
+    super::session_choices::apply(&mut row, &live);
     edited.settings_config["config"] = json!(row.to_string());
     Ok(edited)
 }

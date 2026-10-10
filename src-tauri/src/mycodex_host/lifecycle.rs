@@ -308,8 +308,22 @@ pub(super) fn owns_live(config_text: &str) -> bool {
 }
 
 /// Make `provider` the provider in use, choosing proxy or direct mode for it.
-/// User values of exclusive settings it overrides are restored when it is left.
+/// The session model choices of the provider being left are kept in its row,
+/// and user values of exclusive settings it overrides are restored when it is left.
 pub(super) fn activate(state: &AppState, provider: &Provider) -> Result<()> {
+    super::session_choices::backfill(state)?;
+    // The row may have just been updated with the live choices.
+    let provider = state
+        .db
+        .get_provider_by_id(&provider.id, "codex")
+        .map_err(service_error)?
+        .unwrap_or_else(|| provider.clone());
+    activate_saved(state, &provider)
+}
+
+/// Like [`activate`] for a row that was just saved: its values are newer than
+/// the live file, so nothing is backfilled.
+pub(super) fn activate_saved(state: &AppState, provider: &Provider) -> Result<()> {
     super::shadowed_settings::around(state, provider, || switch_to(state, provider))
 }
 
@@ -359,7 +373,7 @@ pub(super) fn reconcile(state: &AppState) -> Result<()> {
         return Ok(());
     };
     if conversion(&provider)? != mode().is_proxy() {
-        return activate(state, &provider);
+        return activate_saved(state, &provider);
     }
     sync_routing(state);
     Ok(())

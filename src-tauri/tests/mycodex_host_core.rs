@@ -528,6 +528,87 @@ fn exclusive_settings_a_provider_overrides_return_to_the_users_value() {
     resident.shutdown(&p, json!({}));
 }
 
+#[test]
+fn session_model_choices_are_kept_per_provider_across_switches() {
+    let p = Probe::new();
+    let resident = Resident::start(&p);
+    p.save(direct("a"));
+    p.save(direct("b"));
+    p.save(form(
+        "routed",
+        "chat_completions",
+        "https://routed.example.invalid/v1",
+        "routed-model",
+    ));
+    let choice = || {
+        let live = p.live();
+        (
+            live["model"].as_str().unwrap().to_string(),
+            live.get("model_reasoning_effort")
+                .and_then(|v| v.as_str())
+                .map(str::to_string),
+        )
+    };
+    // MyCodex's session settings write these keys through the App Server.
+    let choose = |model: &str, effort: Option<&str>| {
+        let mut doc: toml_edit::DocumentMut = p.live_text().parse().unwrap();
+        doc["model"] = toml_edit::value(model);
+        match effort {
+            Some(effort) => doc["model_reasoning_effort"] = toml_edit::value(effort),
+            None => {
+                doc.remove("model_reasoning_effort");
+            }
+        }
+        fs::write(p.codex.join("config.toml"), doc.to_string()).unwrap();
+    };
+    let expect =
+        |model: &str, effort: Option<&str>| (model.to_string(), effort.map(str::to_string));
+
+    choose("a-chosen", Some("high"));
+    p.apply("b");
+    assert_eq!(choice(), expect("b-model", None));
+    p.apply("a");
+    assert_eq!(
+        choice(),
+        expect("a-chosen", Some("high")),
+        "direct choice returns"
+    );
+
+    p.apply("routed");
+    choose("routed-chosen", Some("xhigh"));
+    p.apply("a");
+    assert_eq!(choice(), expect("a-chosen", Some("high")));
+    p.apply("routed");
+    assert_eq!(
+        choice(),
+        expect("routed-chosen", Some("xhigh")),
+        "routed choice returns"
+    );
+
+    // Resetting the effort to the default is a choice too.
+    choose("routed-chosen", None);
+    p.apply("b");
+    p.apply("routed");
+    assert_eq!(choice(), expect("routed-chosen", None));
+
+    // Saving the current provider with a new model and routing need keeps the form's value.
+    p.apply("a");
+    choose("a-live", Some("low"));
+    let current = p.ok("gui/provider/get", json!({"providerId":"a"}));
+    let mut edit = form(
+        "a",
+        "chat_completions",
+        "https://a.example.invalid/v1",
+        "a-form",
+    );
+    edit["expectedVersion"] = current["version"].clone();
+    p.save(edit);
+    assert_eq!(choice().0, "a-form");
+    p.apply("b");
+    p.apply("a");
+    assert_eq!(choice().0, "a-form");
+    resident.shutdown(&p, json!({}));
+}
 #[cfg(unix)]
 fn endpoint_dir(p: &Probe) -> PathBuf {
     use sha2::{Digest, Sha256};

@@ -218,6 +218,12 @@ Mac SSH 目标验收时“更新后台”失败，界面只显示通用失败。
 - 预设重新导出（上游去掉 Copilot 的代表性 `apiFormat`）。
 - 新增回归测试：`third_party_catalog_does_not_inherit_the_codex_model_cache`（合并前失败：第三方条目继承了 `code_mode_only`）、`workspaces_of_one_user_are_separate_accounts_and_switching_rewrites_auth`（本宿主的托管账号路径合并前后都通过，作为防回归）。
 
+## 后续：会话模型选择回填（0.3.3）
+
+- 问题（自 0.3.0 起）：MyCodex 会话设置把 `model`、`model_reasoning_effort` 写进 `config.toml`，但 v4 把它们当作供应商关键字段，每次切换都按行改写且不回填，切走再切回就回到行里的默认值。3.x 内核会在切换前回填。
+- 修复：`session_choices::backfill` 在 `lifecycle::activate` 切换前，若 live 属于当前供应商（直连按身份、路由按本宿主令牌），把 `model`、`model_reasoning_effort`、`plan_mode_reasoning_effort`、`review_model` 存回当前供应商的行（缺失的推理字段视为恢复默认）。保存当前供应商并因转换需求变化而重新激活时用 `activate_saved`，不回填，以表单为准。表单快照与回填共用同一套覆盖规则，路由中的当前供应商也显示 live 的选择。
+- 回归测试：`session_model_choices_are_kept_per_provider_across_switches`、`chatgpt_session_model_choice_returns_after_switching_away`（去掉回填时都失败）。
+
 ## 主要风险
 
 | 风险 | 应对 |

@@ -451,6 +451,33 @@ fn workspaces_of_one_user_are_separate_accounts_and_switching_rewrites_auth() {
 }
 
 #[test]
+fn chatgpt_session_model_choice_returns_after_switching_away() {
+    let mut gui = Gui::new();
+    external_account(&gui, "alice", "team-workspace", "model-a");
+    gui.start();
+    let account = gui.ok("gui/provider/list", json!({}))["currentProviderId"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let api = gui.ok("gui/provider/save", save("api"));
+    assert_eq!(api["globalApplied"], false);
+    // MyCodex writes the chosen model and effort through the App Server.
+    let path = gui.root.path().join("codex/config.toml");
+    let mut doc: toml_edit::DocumentMut = gui.config().parse().unwrap();
+    doc["model"] = toml_edit::value("gpt-chosen");
+    doc["model_reasoning_effort"] = toml_edit::value("xhigh");
+    std::fs::write(&path, doc.to_string()).unwrap();
+    switch_gui(&gui, "api", "to-api");
+    let config: toml::Value = gui.config().parse().unwrap();
+    assert_eq!(config["model"].as_str(), Some("model-a"), "{config}");
+    assert!(config.get("model_reasoning_effort").is_none(), "{config}");
+    switch_gui(&gui, &account, "to-account");
+    let config: toml::Value = gui.config().parse().unwrap();
+    assert_eq!(config["model"].as_str(), Some("gpt-chosen"), "{config}");
+    assert_eq!(config["model_reasoning_effort"].as_str(), Some("xhigh"));
+}
+
+#[test]
 fn third_party_catalog_does_not_inherit_the_codex_model_cache() {
     let mut gui = Gui::new();
     // Codex's own cache hides gpt-5.5 and announces its retirement.
