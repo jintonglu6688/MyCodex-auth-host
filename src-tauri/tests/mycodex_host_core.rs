@@ -463,6 +463,71 @@ fn mycodex_official_settings_survive_provider_switches() {
     }
     resident.shutdown(&p, json!({}));
 }
+#[test]
+fn exclusive_settings_a_provider_overrides_return_to_the_users_value() {
+    let p = Probe::new();
+    let mut resident = Resident::start(&p);
+    p.save(direct("base"));
+    p.save(direct("other"));
+    // The SudoCode.us preset row sets model_verbosity = "high".
+    let presets = p.ok("gui/preset/list", json!({}));
+    let sudo = presets["presets"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|preset| preset["name"] == "SudoCode.us")
+        .unwrap()
+        .clone();
+    let mut row = form(
+        "sudo",
+        "responses",
+        sudo["baseUrl"].as_str().unwrap(),
+        sudo["model"].as_str().unwrap(),
+    );
+    row["presetId"] = sudo["id"].clone();
+    p.save(row);
+    fs::write(
+        p.codex.join("config.toml"),
+        format!("model_verbosity = \"low\"\n{}", p.live_text()),
+    )
+    .unwrap();
+    let verbosity = || {
+        p.live()
+            .get("model_verbosity")
+            .and_then(|v| v.as_str().map(str::to_string))
+    };
+
+    p.apply("sudo");
+    assert_eq!(verbosity().as_deref(), Some("high"));
+    p.apply("base");
+    assert_eq!(
+        verbosity().as_deref(),
+        Some("low"),
+        "leaving the provider restores the user value"
+    );
+
+    // The remembered value survives a resident restart.
+    p.apply("sudo");
+    resident.shutdown(&p, json!({}));
+    resident = Resident::start(&p);
+    p.apply("other");
+    assert_eq!(verbosity().as_deref(), Some("low"));
+
+    // A choice made while the provider is active wins over the remembered one.
+    p.apply("sudo");
+    let text = p
+        .live_text()
+        .replace("model_verbosity = \"high\"", "model_verbosity = \"medium\"");
+    fs::write(p.codex.join("config.toml"), text).unwrap();
+    p.apply("base");
+    assert_eq!(verbosity().as_deref(), Some("medium"));
+    p.apply("sudo");
+    assert_eq!(verbosity().as_deref(), Some("high"));
+    p.apply("other");
+    assert_eq!(verbosity().as_deref(), Some("medium"));
+    resident.shutdown(&p, json!({}));
+}
+
 #[cfg(unix)]
 fn endpoint_dir(p: &Probe) -> PathBuf {
     use sha2::{Digest, Sha256};

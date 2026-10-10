@@ -308,7 +308,12 @@ pub(super) fn owns_live(config_text: &str) -> bool {
 }
 
 /// Make `provider` the provider in use, choosing proxy or direct mode for it.
+/// User values of exclusive settings it overrides are restored when it is left.
 pub(super) fn activate(state: &AppState, provider: &Provider) -> Result<()> {
+    super::shadowed_settings::around(state, provider, || switch_to(state, provider))
+}
+
+fn switch_to(state: &AppState, provider: &Provider) -> Result<()> {
     let needs_route = conversion(provider)?;
     ROUTING.store(false, Ordering::Release);
     let result = if needs_route {

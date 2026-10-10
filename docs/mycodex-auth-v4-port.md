@@ -208,7 +208,8 @@ Mac SSH 目标验收时“更新后台”失败，界面只显示通用失败。
 - 新增能力 `fullConfigEditor`：`gui/config/provider/view` 返回切换到该供应商后的完整 `config.toml` 和不随切换生效的字段（v4 `editor_view`）；`gui/config/provider/preview` 带 `editorBase` 时按 v4 `plan_save` 拆分，返回供应商行 TOML 和 `globalChanges`。
 - `gui/provider/save` 带 `editor{base,text,onConflict}` 时先按三方比较写全局改动（`codex_editor::write_live`，只写用户改过的键）；默认拒绝冲突并返回 `editorConflict{keys}`，此时行和 `config.toml` 都不写；`keepMine`/`keepTheirs` 由前端冲突对话框选择后重试。不带 `editor` 的保存与之前完全相同。
 - 上游补丁只有两处：三个编辑器模块改为 `pub(crate)`；`TomlEdits::paths` 不再仅限测试。
-- 实测：推理摘要、详细程度、网页搜索在普通、路由、MiMo 之间切换都保留（回归测试 `mycodex_official_settings_survive_provider_switches`）；SudoCode.us 预设自带 `model_verbosity`，切过去会覆盖、切走会删除，是上游行为，暂未处理。
+- 实测：推理摘要、详细程度、网页搜索在普通、路由、MiMo 之间切换都保留（回归测试 `mycodex_official_settings_survive_provider_switches`）；SudoCode.us 预设自带 `model_verbosity`，切过去会覆盖、切走会删除（上游行为）。
+- 修复（未发布，待下个版本）：适配层 `shadowed_settings` 在供应商覆盖独有字段前记下用户的值（数据目录 `shadowed-settings.json`），切走后若被 v4 删除则按三方写回；被覆盖期间用户改过的值优先，不恢复旧值。回归测试 `exclusive_settings_a_provider_overrides_return_to_the_users_value`。
 
 ## 主要风险
 

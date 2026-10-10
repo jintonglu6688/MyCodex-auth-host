@@ -112,16 +112,24 @@ fn persist(host: &Host, previous: Option<&Provider>, edited: Provider) -> Result
     } else {
         // A routed host has no direct pointer, so native add would treat any new
         // row as the first provider and write it live. Inactive rows are stored only.
-        let result = if previous.is_some() {
-            ProviderService::update(state, AppType::Codex, None, edited)
-        } else if applied {
-            ProviderService::add(state, AppType::Codex, edited, false)
-        } else {
-            state.db.save_provider("codex", &edited).map(|_| true)
+        let target = edited.clone();
+        let write = || {
+            let result = if previous.is_some() {
+                ProviderService::update(state, AppType::Codex, None, edited)
+            } else if applied {
+                ProviderService::add(state, AppType::Codex, edited, false)
+            } else {
+                state.db.save_provider("codex", &edited).map(|_| true)
+            };
+            // A native write may have occurred before an error; never advertise safe retry.
+            result.map_err(|_| "save_outcome_unknown")?;
+            lifecycle::reconcile(state).map_err(|_| "save_outcome_unknown")
         };
-        // A native write may have occurred before an error; never advertise safe retry.
-        result.map_err(|_| "save_outcome_unknown")?;
-        lifecycle::reconcile(state).map_err(|_| "save_outcome_unknown")?;
+        if applied {
+            super::shadowed_settings::around(state, &target, write)?;
+        } else {
+            write()?;
+        }
     }
     if current.is_empty() {
         McpService::sync_enabled_for_app(state, &AppType::Codex)

@@ -23,6 +23,7 @@ pub(crate) mod lifecycle;
 mod paths;
 mod runtime_config;
 mod security;
+mod shadowed_settings;
 
 type Result<T> = std::result::Result<T, &'static str>;
 const MAX_REQUEST: usize = 1_048_576;
