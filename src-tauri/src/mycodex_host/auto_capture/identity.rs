@@ -1,5 +1,6 @@
 //! Semantic identity comparison; secret values never leave this module's callers.
 use super::*;
+use crate::live::project::codex::{CodexProjection, RowInput};
 use crate::proxy::providers::codex_oauth_auth::existing_login_identity;
 
 pub(super) struct Identity {
@@ -102,7 +103,7 @@ pub(super) fn identify(live: &Value) -> Result<Option<Identity>> {
         if codex::codex_config_auth_store_mode(text) != codex::CodexAuthStoreMode::File {
             return Err("unsupported_auth_store");
         }
-        if live["auth"].as_object().is_some_and(|a| a.is_empty()) {
+        if live["auth"].as_object().is_none_or(|a| a.is_empty()) {
             return Ok(None);
         }
         let identity =
@@ -166,6 +167,22 @@ pub(super) fn identify(live: &Value) -> Result<Option<Identity>> {
     }))
 }
 
+fn official(provider: &Provider) -> bool {
+    provider.category.as_deref() == Some("official")
+        || crate::proxy::providers::is_codex_official_provider(provider)
+}
+
+/// The key fields v4 would write for `settings`, as normalized `config.toml` text.
+pub(super) fn projection_text(settings: &Value, official: bool) -> Option<String> {
+    CodexProjection::of(&RowInput {
+        settings,
+        official,
+        proxy_injected_oauth: false,
+    })
+    .ok()
+    .map(|projection| projection.catalog_input_text())
+}
+
 pub(super) fn matches(state: &AppState, provider: &Provider, identity: &Identity) -> Result<bool> {
     if let Some(id) = provider
         .meta
@@ -179,53 +196,19 @@ pub(super) fn matches(state: &AppState, provider: &Provider, identity: &Identity
             "sub":stored.subject,"workspace":stored.workspace_id})
         }));
     }
-    let mut effective = provider.settings_config.clone();
-    if !provider.is_codex_oauth() && provider.category.as_deref() != Some("official") {
-        effective["config"] = json!(codex::prepare_codex_provider_live_config(
-            &effective["auth"],
-            effective["config"].as_str().unwrap_or("")
-        )
-        .map_err(service_error)?);
-    }
+    let Some(config) = projection_text(&provider.settings_config, official(provider)) else {
+        return Ok(false);
+    };
+    let effective = json!({"auth":provider.settings_config["auth"],"config":config});
     Ok(identify(&effective)
         .ok()
         .flatten()
         .is_some_and(|stored| stored.value == identity.value))
 }
 
-pub(super) fn same_settings(state: &AppState, provider: &Provider, live: &Value) -> Result<bool> {
-    fn comparable(state: &AppState, provider: &Provider, mut settings: Value) -> Result<Value> {
-        settings = crate::services::provider::strip_common_config_from_live_settings(
-            &state.db,
-            &AppType::Codex,
-            provider,
-            settings,
-        );
-        codex::strip_codex_mcp_servers_from_settings(&mut settings).map_err(service_error)?;
-        if !provider.is_codex_oauth() && provider.category.as_deref() != Some("official") {
-            settings["config"] = json!(codex::prepare_codex_provider_live_config(
-                &settings["auth"],
-                settings["config"].as_str().unwrap_or("")
-            )
-            .map_err(service_error)?);
-            settings["config"] = json!(
-                codex::align_codex_requires_openai_auth_with_login_preservation(
-                    settings["config"].as_str().unwrap_or(""),
-                    crate::settings::preserve_codex_official_auth_on_switch()
-                )
-                .map_err(service_error)?
-            );
-        }
-        // The generated catalog pointer is a native projection, not a private
-        // preference. Preserve user-owned catalog paths with the native helper.
-        let text = codex::set_codex_model_catalog_json_field(
-            settings["config"].as_str().unwrap_or(""),
-            None,
-        )
-        .map_err(service_error)?;
-        // Ignored legacy fields cannot distinguish otherwise identical providers.
-        let text = codex::normalize_live_config(&text).map_err(service_error)?;
-        let mut config: toml::Value = toml::from_str(&text).map_err(|_| "invalid_config")?;
+pub(super) fn same_settings(provider: &Provider, live: &Value) -> Result<bool> {
+    fn comparable(text: &str) -> Option<toml::Value> {
+        let mut config: toml::Value = toml::from_str(text).ok()?;
         if let Some(providers) = config
             .get_mut("model_providers")
             .and_then(toml::Value::as_table_mut)
@@ -235,12 +218,13 @@ pub(super) fn same_settings(state: &AppState, provider: &Provider, live: &Value)
                 .filter_map(|(_, value)| value.as_table_mut())
             {
                 table.remove("name");
+                table.remove("requires_openai_auth");
             }
         }
-        Ok(json!(config))
+        Some(config)
     }
-    Ok(
-        comparable(state, provider, provider.settings_config.clone())?
-            == comparable(state, provider, live.clone())?,
-    )
+    let official = official(provider);
+    let row = projection_text(&provider.settings_config, official).and_then(|t| comparable(&t));
+    let current = projection_text(live, official).and_then(|t| comparable(&t));
+    Ok(row.is_some() && row == current)
 }

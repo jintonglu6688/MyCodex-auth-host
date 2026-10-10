@@ -50,7 +50,7 @@ impl Gui {
         assert!(!ready.is_empty(), "backend exited before ready");
         assert_eq!(
             serde_json::from_str::<Value>(&ready).unwrap()["protocolVersion"],
-            2
+            3
         );
     }
     fn call(&self, method: &str, params: Value) -> Value {
@@ -900,120 +900,6 @@ fn gui_apply_receipts_presets_copy_delete_and_account_failure_contracts() {
 }
 
 #[test]
-fn gui_current_save_and_reapply_capture_tool_preferences_before_common_merge() {
-    for routed in [true, false] {
-        let mut gui = Gui::new();
-        gui.start();
-        let mut edit = save("tools");
-        if routed {
-            edit["kind"] = json!("chat_completions");
-        }
-        gui.ok("gui/provider/save", edit.clone());
-        let path = gui.root.path().join("codex/config.toml");
-        let tools = "\n[plugins.audit]\nenabled=true\n[[skills.config]]\npath='audit/SKILL.md'\nenabled=true\n";
-        std::fs::write(&path, gui.config() + tools).unwrap();
-        switch_gui(&gui, "tools", "seed-tools");
-        let db = rusqlite::Connection::open(gui.root.path().join("store/cc-switch.db")).unwrap();
-        let common = || -> String {
-            db.query_row(
-                "SELECT value FROM settings WHERE key='common_config_codex'",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap()
-        };
-        let flags = |text: &str| {
-            let doc: toml::Value = toml::from_str(text).unwrap();
-            (
-                doc["plugins"]["audit"]["enabled"].as_bool().unwrap(),
-                doc["skills"]["config"][0]["enabled"].as_bool().unwrap(),
-            )
-        };
-        assert_eq!(flags(&common()), (true, true));
-        let changed = gui
-            .config()
-            .replace("enabled = true", "enabled = false")
-            .replace("enabled=true", "enabled=false");
-        std::fs::write(&path, &changed).unwrap();
-        let before_common = common();
-        let fresh = gui.ok("gui/provider/get", json!({"providerId":"tools"}));
-        gui.ok("gui/provider/list", json!({}));
-        assert_eq!(common(), before_common, "reads do not capture live changes");
-        edit["name"] = json!("Renamed tools");
-        edit["expectedVersion"] = json!("stale");
-        assert_eq!(
-            gui.call("gui/provider/save", edit.clone())["error"]["message"],
-            "version_conflict"
-        );
-        assert_eq!(
-            common(),
-            before_common,
-            "version rejection is before capture"
-        );
-        assert_eq!(gui.config(), changed);
-        edit["expectedVersion"] = fresh["version"].clone();
-        gui.ok("gui/provider/save", edit.clone());
-        assert_eq!(
-            flags(&gui.config()),
-            (false, false),
-            "rename keeps live tools: routed={routed}"
-        );
-        assert_eq!(flags(&common()), (false, false));
-        assert!(!common().contains("127.0.0.1"));
-        assert!(!common().contains("PROXY_MANAGED"));
-        assert!(!common().contains("x-mycodex-route-token"));
-        assert!(!common().contains("synthetic-secret"));
-
-        std::fs::write(
-            &path,
-            gui.config()
-                .replace("enabled = false", "enabled = true")
-                .replace("enabled=false", "enabled=true"),
-        )
-        .unwrap();
-        switch_gui(&gui, "tools", "reapply-tools");
-        assert_eq!(flags(&gui.config()), (true, true));
-        assert_eq!(flags(&common()), (true, true));
-
-        // Turning common off captures the old opted-in state, then removes it.
-        std::fs::write(
-            &path,
-            gui.config()
-                .replace("enabled = true", "enabled = false")
-                .replace("enabled=true", "enabled=false"),
-        )
-        .unwrap();
-        edit["expectedVersion"] =
-            gui.ok("gui/provider/get", json!({"providerId":"tools"}))["version"].clone();
-        edit["commonConfigEnabled"] = json!(false);
-        gui.ok("gui/provider/save", edit.clone());
-        let doc: toml::Value = toml::from_str(&gui.config()).unwrap();
-        assert!(doc.get("plugins").is_none());
-        assert!(doc.get("skills").is_none());
-        assert_eq!(flags(&common()), (false, false));
-
-        // A private opt-out edit must not replace shared preferences on opt-in.
-        std::fs::write(&path, gui.config() + tools).unwrap();
-        edit["expectedVersion"] =
-            gui.ok("gui/provider/get", json!({"providerId":"tools"}))["version"].clone();
-        edit["commonConfigEnabled"] = json!(true);
-        gui.ok("gui/provider/save", edit);
-        assert_eq!(flags(&gui.config()), (false, false));
-        assert_eq!(flags(&common()), (false, false));
-
-        // Respect upstream's explicitly-cleared marker rather than recreate it.
-        db.execute(
-            "UPDATE settings SET value='' WHERE key='common_config_codex'",
-            [],
-        )
-        .unwrap();
-        db.execute("INSERT OR REPLACE INTO settings(key,value) VALUES('common_config_codex_cleared','true')", []).unwrap();
-        switch_gui(&gui, "tools", "cleared-tools");
-        assert_eq!(common(), "");
-    }
-}
-
-#[test]
 fn gui_routed_switches_capture_live_tools_before_backup_restore_and_restart() {
     let mut gui = Gui::new();
     gui.start();
@@ -1067,21 +953,19 @@ fn gui_routed_switches_capture_live_tools_before_backup_restore_and_restart() {
     let state: toml::Value = toml::from_str(&gui.config()).unwrap();
     assert!(state.get("plugins").is_none());
     assert!(state.get("skills").is_none());
+    // Route state belongs to the client contract, never to provider rows.
     let db = rusqlite::Connection::open(gui.root.path().join("store/cc-switch.db")).unwrap();
-    let common: String = db
-        .query_row(
-            "SELECT value FROM settings WHERE key='common_config_codex'",
-            [],
-            |row| row.get(0),
-        )
+    let mut rows = db
+        .prepare("SELECT settings_config FROM providers WHERE app_type='codex'")
         .unwrap();
-    for forbidden in [
-        "127.0.0.1",
-        "PROXY_MANAGED",
-        "x-mycodex-route-token",
-        "synthetic-secret",
-    ] {
-        assert!(!common.contains(forbidden));
+    for settings in rows.query_map([], |row| row.get::<_, String>(0)).unwrap() {
+        let settings = settings.unwrap();
+        for forbidden in ["127.0.0.1", "PROXY_MANAGED", "x-mycodex-route-token"] {
+            assert!(
+                !settings.contains(forbidden),
+                "{forbidden} in a provider row"
+            );
+        }
     }
 }
 
@@ -1093,17 +977,33 @@ fn chatgpt_catalog_repair_on_apply_preserves_live_auth_and_stops_discovery() {
     let listed = gui.ok("gui/provider/list", json!({}));
     let id = listed["currentProviderId"].as_str().unwrap();
     let auth = std::fs::read(gui.root.path().join("codex/auth.json")).unwrap();
-    // Seed the legacy persisted shape through the native API used by older hosts.
-    gui.ok(
-        "provider/update",
-        json!({"provider": {
-            "id":id,"name":"Legacy account","category":"official",
-            "meta":{"providerType":"codex_oauth","authBinding":{"source":"managed_account",
-                "authProvider":"codex_oauth","accountId":listed["providers"][0]["accountId"]}},
-            "settingsConfig":{"auth":{},
-                "config":"model='model-a'\n","modelCatalog":{"models":[{"model":"wrong-model"}]}}
-        }}),
-    );
+    // Seed the legacy shape an older host left: a catalog on the account row and
+    // the generated catalog pointer in the live file.
+    gui.stop();
+    let db = rusqlite::Connection::open(gui.root.path().join("store/cc-switch.db")).unwrap();
+    db.execute(
+        "UPDATE providers SET settings_config=?1 WHERE id=?2 AND app_type='codex'",
+        rusqlite::params![
+            json!({"auth":{},"config":"model='model-a'\n",
+                "modelCatalog":{"models":[{"model":"wrong-model"}]}})
+            .to_string(),
+            id
+        ],
+    )
+    .unwrap();
+    drop(db);
+    let catalog = gui.root.path().join("codex/cc-switch-model-catalog.json");
+    std::fs::write(&catalog, "{\"models\":[]}").unwrap();
+    std::fs::write(
+        gui.root.path().join("codex/config.toml"),
+        format!(
+            "{}model_catalog_json = {}\n",
+            gui.config(),
+            toml::Value::String(catalog.to_string_lossy().into_owned())
+        ),
+    )
+    .unwrap();
+    gui.start();
     assert!(gui.config().contains("model_catalog_json"));
     let before = gui.config();
     gui.ok("gui/provider/list", json!({}));
@@ -1201,54 +1101,7 @@ fn toml_provider_drafts_roundtrip_without_writing_until_save() {
 }
 
 #[test]
-fn common_editor_uses_native_merge_clear_and_version_checks_with_and_without_route() {
-    for kind in ["responses", "chat_completions"] {
-        let mut gui = Gui::new();
-        gui.start();
-        let mut params = save("common-editor");
-        params["kind"] = json!(kind);
-        gui.ok("gui/provider/save", params);
-        let original = gui.ok("gui/config/common/get", json!({}));
-        let before = gui.config();
-        let invalid =
-            json!({"text":"bad=[synthetic-secret", "expectedVersion":original["version"]});
-        assert_eq!(
-            gui.call("gui/config/common/save", invalid)["error"]["message"],
-            "invalid_config"
-        );
-        assert_eq!(before, gui.config());
-        let update = json!({"text":"disable_response_storage=true\nmodel_reasoning_effort='high'\nmodel_context_window=1000000\n", "expectedVersion":original["version"]});
-        assert_eq!(
-            gui.ok("gui/config/common/save", update.clone())["globalApplied"],
-            true
-        );
-        assert_eq!(
-            gui.call("gui/config/common/save", update)["error"]["message"],
-            "version_conflict"
-        );
-        let live: toml::Value = gui.config().parse().unwrap();
-        assert_eq!(live["model_context_window"].as_integer(), Some(1000000));
-        assert!(live.get("disable_response_storage").is_none());
-        gui.stop();
-        gui.start();
-        let current = gui.ok("gui/config/common/get", json!({}));
-        assert!(current["text"]
-            .as_str()
-            .unwrap()
-            .contains("model_reasoning_effort"));
-        gui.ok(
-            "gui/config/common/save",
-            json!({"text":"", "expectedVersion":current["version"]}),
-        );
-        let live: toml::Value = gui.config().parse().unwrap();
-        assert!(live.get("model_context_window").is_none());
-        assert!(live.get("model_reasoning_effort").is_none());
-        assert_eq!(gui.ok("gui/config/common/get", json!({}))["text"], "");
-    }
-}
-
-#[test]
-fn provider_editor_shows_live_and_common_toml_like_native_editor() {
+fn provider_editor_shows_the_rows_own_toml_and_leaves_global_settings_in_live() {
     let mut gui = Gui::new();
     external_account(&gui, "editor", "team", "model-a");
     gui.start();
@@ -1259,17 +1112,16 @@ fn provider_editor_shows_live_and_common_toml_like_native_editor() {
         json!({
             "id": row["id"], "expectedVersion":row["version"], "name":"Named account",
             "kind":"chatgpt", "model":row["model"], "accountId":row["accountId"],
-            "commonConfigEnabled":true, "advanced":row["advanced"]
+            "advanced":row["advanced"]
         }),
     );
     let config: toml::Value = preview["text"].as_str().unwrap().parse().unwrap();
-    assert_eq!(
-        config
-            .get("model_reasoning_summary")
-            .and_then(toml::Value::as_str),
-        Some("detailed"),
-        "Native editor includes the active live configuration and common fields"
+    assert_eq!(config["model"].as_str(), Some("model-a"));
+    assert!(
+        config.get("model_reasoning_summary").is_none(),
+        "Global settings stay in the live file, not in the provider row"
     );
+    assert!(gui.config().contains("model_reasoning_summary"));
 }
 
 #[test]

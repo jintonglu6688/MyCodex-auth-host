@@ -52,8 +52,7 @@ pub(super) fn fingerprint(host: &Host) -> Result<String> {
         }
     }
     Ok(form::hash(&json!({"files":files,
-        "current":ProviderService::current(state,AppType::Codex).map_err(service_error)?,
-        "common":state.db.get_config_snippet("codex").map_err(service_error)?})))
+        "current":ProviderService::current(state,AppType::Codex).map_err(service_error)?})))
 }
 
 pub(super) fn edit_base(host: &Host, params: &Value) -> Result<(Option<Provider>, Provider)> {
@@ -93,6 +92,44 @@ pub(super) fn edit_base(host: &Host, params: &Value) -> Result<(Option<Provider>
     Ok((previous, edited))
 }
 
+// Persist an edited row. A row in use whose route need no longer matches the
+// mode is stored first, then switched into the right mode.
+fn persist(host: &Host, previous: Option<&Provider>, edited: Provider) -> Result<bool> {
+    let state = &host.state;
+    let id = edited.id.clone();
+    let current = ProviderService::current(state, AppType::Codex).map_err(service_error)?;
+    let applied = current == id || (previous.is_none() && current.is_empty());
+    let needs_route = lifecycle::conversion(&edited)?;
+    if current.is_empty() && previous.is_none() {
+        McpService::import_from_codex(state).map_err(service_error)?;
+    }
+    if applied && needs_route != lifecycle::is_proxy() {
+        state
+            .db
+            .save_provider("codex", &edited)
+            .map_err(|_| "save_outcome_unknown")?;
+        lifecycle::activate(state, &edited).map_err(|_| "save_outcome_unknown")?;
+    } else {
+        // A routed host has no direct pointer, so native add would treat any new
+        // row as the first provider and write it live. Inactive rows are stored only.
+        let result = if previous.is_some() {
+            ProviderService::update(state, AppType::Codex, None, edited)
+        } else if applied {
+            ProviderService::add(state, AppType::Codex, edited, false)
+        } else {
+            state.db.save_provider("codex", &edited).map(|_| true)
+        };
+        // A native write may have occurred before an error; never advertise safe retry.
+        result.map_err(|_| "save_outcome_unknown")?;
+        lifecycle::reconcile(state).map_err(|_| "save_outcome_unknown")?;
+    }
+    if current.is_empty() {
+        McpService::sync_enabled_for_app(state, &AppType::Codex)
+            .map_err(|_| "save_outcome_unknown")?;
+    }
+    Ok(applied)
+}
+
 pub(super) fn handle(host: &Host, method: &str, params: &Value) -> Result<Value> {
     let state = &host.state;
     match method {
@@ -111,11 +148,7 @@ pub(super) fn handle(host: &Host, method: &str, params: &Value) -> Result<Value>
                 .map_err(service_error)?
                 .values()
             {
-                let edited = if current == stored.id && captured.error.is_none() {
-                    form::snapshot(state, stored)?
-                } else {
-                    stored.clone()
-                };
+                let edited = form::snapshot(state, stored)?;
                 let row = form::summary(state, stored, &edited)?;
                 if stored.id == current {
                     current_version = form::version(stored, &edited);
@@ -144,7 +177,7 @@ pub(super) fn handle(host: &Host, method: &str, params: &Value) -> Result<Value>
             auto_capture::before_write(state)?;
             let id = params["id"].as_str().ok_or("invalid_params")?;
             let (previous, edited) = edit_base(host, params)?;
-            let mut edited = form::edit(edited, params)?;
+            let edited = form::edit(edited, params)?;
             if let Some(account) = edited
                 .meta
                 .as_ref()
@@ -158,44 +191,7 @@ pub(super) fn handle(host: &Host, method: &str, params: &Value) -> Result<Value>
                     return Err("account_not_found");
                 }
             }
-            lifecycle::conversion(&edited)?;
-            let current = ProviderService::current(state, AppType::Codex).map_err(service_error)?;
-            let applied = current == id || (previous.is_none() && current.is_empty());
-            if current == id {
-                if let Some(stored) = &previous {
-                    lifecycle::capture_current_common(state)?;
-                    // Strip the newly captured common values before applying the
-                    // requested flag, including true -> false and false -> true.
-                    edited = form::edit(form::snapshot(state, stored)?, params)?;
-                }
-            }
-            if applied {
-                if current.is_empty() {
-                    McpService::import_from_codex(state).map_err(service_error)?;
-                }
-                lifecycle::prepare(state, &edited)?;
-            }
-            let result = if previous.is_some() {
-                ProviderService::update(state, AppType::Codex, None, edited)
-            } else {
-                ProviderService::add(state, AppType::Codex, edited, false)
-            };
-            if current.is_empty() && result.is_ok() {
-                McpService::sync_enabled_for_app(state, &AppType::Codex)
-                    .map_err(|_| "save_outcome_unknown")?;
-            }
-            if result.is_err() && applied {
-                lifecycle::stop_listener(state).map_err(|_| "save_outcome_unknown")?;
-            }
-            // A failed native write must never reapply an old conversion row.
-            result.map_err(|_| "save_outcome_unknown")?;
-            let reconciled = if applied {
-                lifecycle::reconcile(state)
-            } else {
-                Ok(())
-            };
-            // A native write may have occurred before either error; never advertise safe retry.
-            reconciled.map_err(|_| "save_outcome_unknown")?;
+            let applied = persist(host, previous.as_ref(), edited)?;
             let stored = form::stored(state, id).map_err(|_| "save_outcome_unknown")?;
             let edited = form::snapshot(state, &stored).map_err(|_| "save_outcome_unknown")?;
             let mut result =
@@ -226,7 +222,10 @@ pub(super) fn handle(host: &Host, method: &str, params: &Value) -> Result<Value>
             edited.created_at = None;
             edited.sort_index = None;
             lifecycle::conversion(&edited)?;
-            ProviderService::add(state, AppType::Codex, edited, false)
+            // A copy is never in use; store the row without native activation.
+            state
+                .db
+                .save_provider("codex", &edited)
                 .map_err(|_| "save_outcome_unknown")?;
             let stored = form::stored(state, id)?;
             form::summary(state, &stored, &stored)
@@ -235,12 +234,15 @@ pub(super) fn handle(host: &Host, method: &str, params: &Value) -> Result<Value>
             let _guard = lifecycle::mutation()?;
             auto_capture::before_write(state)?;
             let (stored, _) = selected(host, params, true)?;
+            // Neither the provider in use nor the direct pointer restored on exit.
             if ProviderService::current(state, AppType::Codex).map_err(service_error)? == stored.id
-                || state
-                    .db
-                    .get_current_provider("codex")
-                    .map_err(service_error)?
-                    .as_deref()
+                || crate::mode::current::provider_for(
+                    &state.db,
+                    &AppType::Codex,
+                    crate::mode::current::Purpose::Direct,
+                )
+                .map_err(service_error)?
+                .as_deref()
                     == Some(&stored.id)
             {
                 return Err("provider_in_use");
@@ -290,18 +292,11 @@ pub(super) fn handle(host: &Host, method: &str, params: &Value) -> Result<Value>
                     .operations
                     .insert(operation.into(), (request_hash, None));
             }
-            lifecycle::capture_current_common(state)?;
-            lifecycle::prepare(state, &edited)?;
             if form::clear_chatgpt_catalog(&mut edited)? {
-                ProviderService::update(state, AppType::Codex, None, edited)
+                ProviderService::update(state, AppType::Codex, None, edited.clone())
                     .map_err(|_| "operation_unknown")?;
             }
-            let result = ProviderService::switch(state, AppType::Codex, &stored.id);
-            if result.is_err() {
-                lifecycle::stop_listener(state).map_err(|_| "operation_unknown")?;
-            }
-            result.map_err(|_| "operation_unknown")?;
-            lifecycle::reconcile(state).map_err(|_| "operation_unknown")?;
+            lifecycle::activate(state, &edited).map_err(|_| "operation_unknown")?;
             let response =
                 json!({"operationId":operation,"providerId":stored.id,"status":"applied"});
             if let Some((_, receipt)) = host

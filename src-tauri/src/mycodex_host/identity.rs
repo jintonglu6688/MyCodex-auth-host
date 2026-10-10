@@ -4,7 +4,7 @@ use sha2::{Digest, Sha256};
 use std::io::Read;
 use std::sync::OnceLock;
 
-pub(super) const PROTOCOL_VERSION: u32 = 2;
+pub(super) const PROTOCOL_VERSION: u32 = 3;
 
 pub(super) fn identity() -> Result<Value> {
     static HASH: OnceLock<Result<String>> = OnceLock::new();
@@ -31,7 +31,7 @@ pub(super) fn identity() -> Result<Value> {
         .map_err(|code| *code)?;
     Ok(json!({
         "protocolVersion": PROTOCOL_VERSION,
-        "hostVersion": "0.2.3",
+        "hostVersion": "0.3.0",
         "upstreamRevision": UPSTREAM,
         "sourceRevision": env!("MYCODEX_CORE_SOURCE_REVISION"),
         "sourceDirty": env!("MYCODEX_CORE_SOURCE_DIRTY") != "false",

@@ -1,11 +1,13 @@
 //! Platform policy around the v4 Codex mode services.
 //!
-//! Phase 1 of docs/mycodex-auth-v4-port.md keeps the route credential, request
-//! gate and target checks. Route activation moves onto the v4 mode controller in
-//! phase 2; until then the gate rejects every routed request.
+//! MyCodex has no mode switch of its own: a provider that needs protocol
+//! conversion runs in v4 proxy mode with itself as the route, every other
+//! provider runs direct. Routed requests must carry this store's credential.
 use super::{service_error, Result};
-use crate::mode::state::Mode;
-use crate::{AppState, AppType};
+use crate::live::engine::DeviceStore;
+use crate::live::project::codex::ROUTE_ID;
+use crate::mode::state::{Mode, ModeState, PendingTarget};
+use crate::{AppState, AppType, Provider, ProviderService};
 use axum::{
     body::Body,
     extract::Request,
@@ -61,6 +63,13 @@ fn initialize_route_token(state: &AppState) -> Result<()> {
         .map_err(|_| "runtime_already_initialized")
 }
 
+/// The header the v4 proxy route table must carry for this host.
+pub(crate) fn route_credential() -> Option<(&'static str, &'static str)> {
+    ROUTE_TOKEN
+        .get()
+        .map(|token| (ROUTE_HEADER, token.as_str()))
+}
+
 fn route_token_matches(value: &str) -> bool {
     ROUTE_TOKEN.get().is_some_and(|token| {
         value.len() == token.len()
@@ -70,6 +79,16 @@ fn route_token_matches(value: &str) -> bool {
                 .fold(0u8, |difference, (a, b)| difference | (a ^ b))
                 == 0
     })
+}
+
+fn has_route_header(value: &toml::Value) -> bool {
+    match value {
+        toml::Value::Table(table) => table
+            .iter()
+            .any(|(key, value)| key.eq_ignore_ascii_case(ROUTE_HEADER) || has_route_header(value)),
+        toml::Value::Array(values) => values.iter().any(has_route_header),
+        _ => false,
+    }
 }
 
 pub(super) fn mutation() -> Result<OwnedRwLockWriteGuard<()>> {
@@ -119,6 +138,86 @@ pub(crate) async fn admit(mut request: Request, next: Next) -> Response {
     })
 }
 
+/// Validates a Codex provider for this host and reports whether it needs the
+/// local conversion route.
+pub(super) fn conversion(provider: &Provider) -> Result<bool> {
+    use crate::proxy::providers::{
+        is_codex_official_provider, should_convert_codex_responses_to_anthropic,
+        should_convert_codex_responses_to_chat, CodexAdapter, ProviderAdapter,
+    };
+    let config = provider.settings_config["config"].as_str().unwrap_or("");
+    let parsed: toml::Value = toml::from_str(config).map_err(|_| "invalid_provider")?;
+    if has_route_header(&parsed) {
+        return Err("reserved_route_header");
+    }
+    let source = parsed
+        .get("model_provider")
+        .and_then(toml::Value::as_str)
+        .unwrap_or("openai");
+    // Use the same URL precedence as actual upstream forwarding.
+    let base = CodexAdapter.extract_base_url(provider).ok();
+    let official_api = match base.as_deref() {
+        None => source == "openai",
+        Some(base) => reqwest::Url::parse(base)
+            .ok()
+            .and_then(|url| url.host_str().map(str::to_owned))
+            .is_some_and(|host| {
+                host.eq_ignore_ascii_case("api.openai.com")
+                    || host.eq_ignore_ascii_case("chatgpt.com")
+            }),
+    };
+    if provider.settings_config["auth"]["OPENAI_API_KEY"].as_str() == Some("PROXY_MANAGED")
+        || crate::codex_config::extract_codex_experimental_bearer_token(config).as_deref()
+            == Some("PROXY_MANAGED")
+        || crate::codex_config::codex_config_has_official_proxy_route(config)
+    {
+        return Err("route_takeover_not_supported");
+    }
+    if let Some(binding) = provider.meta.as_ref().and_then(|m| m.auth_binding.as_ref()) {
+        if binding.source == crate::provider::AuthBindingSource::ManagedAccount
+            && binding.auth_provider.as_deref() != Some("codex_oauth")
+        {
+            return Err("unsupported_managed_account");
+        }
+    }
+    if provider.uses_proxy_injected_oauth() {
+        return Err("unsupported_managed_account");
+    }
+    let declared = [
+        provider.meta.as_ref().and_then(|m| m.api_format.as_deref()),
+        provider.settings_config["api_format"].as_str(),
+        provider.settings_config["apiFormat"].as_str(),
+    ];
+    let mut format = None;
+    for value in declared.into_iter().flatten() {
+        if !matches!(value, "openai_responses" | "openai_chat" | "anthropic") {
+            return Err("unsupported_api_format");
+        }
+        if format.is_some_and(|previous| previous != value) {
+            return Err("conflicting_api_format");
+        }
+        format = Some(value);
+    }
+    let convert = should_convert_codex_responses_to_anthropic(provider, "/responses")
+        || should_convert_codex_responses_to_chat(provider, "/responses");
+    if official_api
+        || is_codex_official_provider(provider)
+        || provider.category.as_deref() == Some("official")
+        || provider.is_codex_oauth()
+        || provider
+            .meta
+            .as_ref()
+            .and_then(|m| m.auth_binding.as_ref())
+            .is_some_and(|b| b.source == crate::provider::AuthBindingSource::ManagedAccount)
+    {
+        if convert {
+            return Err("official_requires_native_responses");
+        }
+        return Ok(false);
+    }
+    Ok(convert)
+}
+
 pub(super) fn configure(state: &AppState) -> Result<()> {
     // The private database belongs exclusively to this Codex target. Never run
     // upstream all-app startup/restore, which would inspect unrelated homes.
@@ -157,15 +256,158 @@ pub(super) fn configure(state: &AppState) -> Result<()> {
     initialize_route_token(state)
 }
 
-// Finish interrupted writes, then settle only this target's Codex mode.
+fn mode() -> ModeState {
+    crate::mode::current::mode_state(&AppType::Codex)
+}
+
+pub(super) fn is_proxy() -> bool {
+    mode().is_proxy()
+}
+
+/// Accept routed requests only while the client is attached to a running proxy.
+pub(super) fn sync_routing(state: &AppState) {
+    let attached = mode().attached && block_on(state.proxy_service.is_running());
+    ROUTING.store(attached, Ordering::Release);
+}
+
+/// Stop accepting routed requests as soon as the client no longer points here.
+pub(super) fn pause_if_external() {
+    if ROUTING.load(Ordering::Acquire) {
+        let owned = super::auto_capture::live_config_text()
+            .map(|text| owns_live(&text))
+            .unwrap_or(false);
+        if !owned {
+            ROUTING.store(false, Ordering::Release);
+        }
+    }
+}
+
+/// Codex is attached to this host's proxy: the selected route table is the v4
+/// route table and carries exactly this store's credential.
+pub(super) fn owns_live(config_text: &str) -> bool {
+    if !mode().attached {
+        return false;
+    }
+    let Ok(doc) = toml::from_str::<toml::Value>(config_text) else {
+        return false;
+    };
+    if doc.get("model_provider").and_then(toml::Value::as_str) != Some(ROUTE_ID) {
+        return false;
+    }
+    doc.get("model_providers")
+        .and_then(|value| value.get(ROUTE_ID))
+        .and_then(|value| value.get("http_headers"))
+        .and_then(toml::Value::as_table)
+        .is_some_and(|headers| {
+            let values = headers
+                .iter()
+                .filter(|(key, _)| key.eq_ignore_ascii_case(ROUTE_HEADER))
+                .collect::<Vec<_>>();
+            values.len() == 1 && values[0].1.as_str().is_some_and(route_token_matches)
+        })
+}
+
+/// Make `provider` the provider in use, choosing proxy or direct mode for it.
+pub(super) fn activate(state: &AppState, provider: &Provider) -> Result<()> {
+    let needs_route = conversion(provider)?;
+    ROUTING.store(false, Ordering::Release);
+    let result = if needs_route {
+        if mode().is_proxy() {
+            ProviderService::switch(state, AppType::Codex, &provider.id)
+                .map(|_| ())
+                .map_err(|_| "route_start_failed")
+        } else {
+            block_on(crate::mode::controller::enter_with_route(
+                state,
+                &AppType::Codex,
+                false,
+                Some(&provider.id),
+            ))
+            .map_err(|_| "route_start_failed")
+        }
+    } else {
+        let exited = if mode().is_proxy() {
+            block_on(crate::mode::controller::exit(state, &AppType::Codex))
+                .map_err(|_| "route_stop_failed")
+        } else {
+            Ok(())
+        };
+        exited.and_then(|_| {
+            ProviderService::switch(state, AppType::Codex, &provider.id)
+                .map(|_| ())
+                .map_err(service_error)
+        })
+    };
+    sync_routing(state);
+    result
+}
+
+/// After an edit, keep the mode consistent with the provider now in use.
+pub(super) fn reconcile(state: &AppState) -> Result<()> {
+    let current = ProviderService::current(state, AppType::Codex).map_err(service_error)?;
+    let Some(provider) = state
+        .db
+        .get_provider_by_id(&current, "codex")
+        .map_err(service_error)?
+    else {
+        sync_routing(state);
+        return Ok(());
+    };
+    if conversion(&provider)? != mode().is_proxy() {
+        return activate(state, &provider);
+    }
+    sync_routing(state);
+    Ok(())
+}
+
+/// The client was switched by someone else while attached: keep the external
+/// files and record direct mode without writing them.
+pub(super) fn detach_external(state: &AppState) -> Result<()> {
+    ROUTING.store(false, Ordering::Release);
+    let current = mode();
+    if !current.attached && !current.is_proxy() {
+        return Ok(());
+    }
+    let _guard = crate::mode::controller::lock_settled_blocking(state, &AppType::Codex)
+        .map_err(service_error)?;
+    crate::mode::operation::commit_target(
+        &state.db,
+        &DeviceStore::for_device(),
+        AppType::Codex.as_str(),
+        &PendingTarget::mode(ModeState {
+            mode: Some(Mode::Direct),
+            attached: false,
+            proxy_route: current.proxy_route,
+            contract: None,
+        }),
+    )
+    .map_err(service_error)?;
+    stop_listener(state)
+}
+
+// Finish interrupted writes, then settle only this target's Codex mode. Never
+// reattach over a client someone else switched while this host was stopped.
 pub(super) fn startup(state: &AppState) -> Result<()> {
-    let _guard = mutation()?;
-    crate::mode::operation::recover_on_startup(&state.db);
-    block_on(crate::mode::controller::startup_single(
-        state,
-        &AppType::Codex,
-    ))
-    .map_err(|_| "mode_startup_failed")
+    {
+        let _guard = mutation()?;
+        crate::mode::operation::recover_on_startup(&state.db);
+        if mode().attached
+            && !super::auto_capture::live_config_text()
+                .map(|text| owns_live(&text))
+                .unwrap_or(false)
+        {
+            detach_external(state)?;
+        }
+        let result = block_on(crate::mode::controller::startup_single(
+            state,
+            &AppType::Codex,
+        ))
+        .map_err(|_| "mode_startup_failed");
+        sync_routing(state);
+        result?;
+    }
+    // Adopt the effective identity once before serving requests.
+    super::auto_capture::read(state).map(|_| ())
 }
 
 // An explicit maintenance stop must remain possible with malformed live files.
@@ -179,7 +421,7 @@ pub(super) fn stop_listener(state: &AppState) -> Result<()> {
 
 pub(super) fn status(state: &AppState) -> Result<Value> {
     let status = block_on(state.proxy_service.get_status()).map_err(|_| "route_status_failed")?;
-    let mode = crate::mode::current::mode_state(&AppType::Codex);
+    let mode = mode();
     Ok(json!({
         "mode": match mode.mode {
             Some(Mode::Direct) => json!("direct"),
@@ -187,6 +429,8 @@ pub(super) fn status(state: &AppState) -> Result<Value> {
             None => Value::Null,
         },
         "attached": mode.attached,
+        // Codex is routed through this host; restarting the host must resume it.
+        "takeover": mode.attached,
         "running": status.running,
         "accepting": ROUTING.load(Ordering::Acquire),
         "port": status.port,

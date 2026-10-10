@@ -158,6 +158,34 @@
   - 切回托管账号需要用刷新令牌换取访问令牌（托管账号库只存刷新令牌）；在上述保护下按预期失败，且失败后客户端文件不变。正常环境下这一步需要联网。
 - **尚未完成**：旧接管备份残留和路由模式下的迁移样本（用 0.2.3 常驻模式生成合成数据），第二阶段与路由重建一起验证。原有的 `tests/mycodex_host_core.rs`、`tests/mycodex_gui.rs` 针对 v3 协议，在本分支上预期失败，第二阶段重写。
 
+## 第二阶段实现与决定
+
+适配层已在 v4 上重建（`hostVersion` 0.3.0，`protocolVersion` 3），与方案的差异和新增决定如下：
+
+- **模式自动选择**：前端没有模式概念。需要转换的供应商用 `mode::controller::enter_with_route` 进入代理模式并以自己为路由；其余供应商先 `exit` 再 `ProviderService::switch` 直连（`lifecycle::activate`）。保存当前供应商时，若其是否需要转换与当前模式不一致，先存行再切换模式，不让 v4 按直连写入转换供应商。
+- **路由令牌**：v4 生成代理路由表（`proxy_route_table`）时为宿主加入 `x-mycodex-route-token` 请求头；宿主只在 `config.toml` 选中 `custom` 表且该表恰好带本存储令牌时认为路由属于自己。
+- **路由端口**：监听端口保持 0（系统分配），宿主重启后重新绑定并重写客户端契约。Codex 每次请求重读 `config.toml`，无需重启 Codex。3.x 会沿用原端口，这一点有变化。
+- **启动顺序**：先补完中断写入；若模式记录为已接上但 `config.toml` 已不属于本宿主（外部切换），只落定直连模式，不写客户端文件；再执行只针对 Codex 的 `startup_single`；最后做一次全局身份捕获（与 3.x 启动时先捕获再恢复路由一致）。外部切换到别的供应商时客户端文件逐字节保留；仍指向本宿主代理占位符的残留（例如令牌被改动）由 v4 退为清空路由关键字段，避免 Codex 指向拒绝它的代理。
+- **全局身份捕获**：用 `CodexProjection::of` 把供应商行投影成 v4 会写入的关键字段，再与 live 比较身份和是否完全一致；新建的供应商行只保存关键字段。外部登录导入、多账号积累、诊断日志保持不变。
+- **当前供应商的模型**：v4 不回填 live 的关键字段，而 MyCodex 会话设置会写 `model` 和 `model_reasoning_effort`。直连使用中、且 live 身份属于该供应商时，表单显示和保存以 live 的 `model`、`model_reasoning_effort`、`plan_mode_reasoning_effort`、`review_model` 为准，读取时不写回行（与 3.x 快照语义一致）。
+- **新增与复制**：路由模式下 v4 的直连指针为空，`ProviderService::add` 会把任何新行当作第一个供应商写入 live。未生效的新增和复制只存行，不经过原生激活。
+- **配置编辑**：`gui/config/provider/preview` 返回供应商行自己的 TOML（关键字段）；全局设置留在 `config.toml`。v4 的“切换后完整 `config.toml` 预览 + 三方冲突选择”需要前端设计冲突界面，列为后续项，本次未接入。
+- **遗留设置**：宿主运行时 `disable_response_storage` 不作为关键字段管理；`runtime/prepare` 的清理（含 MCP 表 `type`）移入 `mycodex_host/runtime_config.rs`，删除了上游文件补丁 `codex_config_compat.rs`。
+- **MCP**：重新打上导入时完整保留嵌套未知字段、JSON→TOML 无损转换的补丁（`mcp/codex.rs`）；只有 `url` 的条目按 HTTP、不写 `type` 已由 v4 自身修复；v4 的 `write_text_file` 已是原子写入。
+- **预设**：用 `scripts/Export-MyCodexPresets.mjs` 从 v4 的 `codexProviderPresets.ts` 重新导出。
+- **测试**：`tests/mycodex_host_core.rs`（16 个，含两个需要 `MYCODEX_V3_HOST` 的 3.x 直连/路由迁移用例）和 `tests/mycodex_gui.rs`（22 个）按协议 3 重写；删除离线探测、原生 provider/account 方法和通用配置相关用例；`tests/mycodex_host_v4.rs` 已并入 core。适配层单元测试 18 个。发布脚本版本与协议已同步，`python -B scripts/Test-MyCodexAuthRelease.py` 通过。
+
+协议 3 相对协议 2 的接口变化（前端第三阶段据此适配）：
+
+| 接口 | 变化 |
+| --- | --- |
+| `status.capabilities` | 去掉 `commonConfig` |
+| `status.route` / `gui/provider/list.route` | 新增 `mode`（`direct`/`proxy`/`null`）、`attached`；`takeover` 表示 Codex 正通过本宿主路由（重启宿主须恢复）；`running`、`accepting`、`port`、`activeConnections` 不变 |
+| 供应商摘要 | 去掉 `commonConfigEnabled`；保存时忽略该参数 |
+| `gui/config/common/get`、`save` | 删除（`method_not_supported`） |
+| `gui/config/provider/preview` | 返回供应商行自己的 TOML |
+| 非 `gui/` 前缀的 `provider/*`、`account/*`、`mcp/import`，离线 `request` 命令 | 删除 |
+
 ## 主要风险
 
 | 风险 | 应对 |
@@ -175,3 +203,4 @@
 | 2026-10-10 | 规划 | 本方案定稿 |
 | 2026-10-10 | 第一阶段 | 建 `port/v4` 并合并 v4.0.5；宿主在 v4 上编译；设备目录重定向；只启动 Codex；最小链路和合成数据迁移测试通过；`runtime/prepare` 评估为保留 |
 | 2026-10-10 | 第一阶段 | 真实私有库副本迁移验证通过（结果见“第一阶段发现”）；`port/v4` 推送到 GitHub |
+| 2026-10-10 | 第二阶段 | 适配层在 v4 上重建，协议 3、版本 0.3.0；本地原生进程测试 38 个和适配层单元测试 18 个通过（见“第二阶段实现与决定”）；四平台云构建待运行 |

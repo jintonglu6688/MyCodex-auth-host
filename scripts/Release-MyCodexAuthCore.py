@@ -47,8 +47,8 @@ def validate(manifest, target, revision):
     require(re.fullmatch(r"[0-9a-f]{40}", revision) is not None
             and manifest.get("sourceRevision") == revision, "Unexpected source revision.")
     require(manifest.get("sourceDirty") is False, "Cloud releases require clean source.")
-    require(manifest.get("schemaVersion") == 1 and manifest.get("protocolVersion") == 2
-            and manifest.get("hostVersion") == "0.2.3"
+    require(manifest.get("schemaVersion") == 1 and manifest.get("protocolVersion") == 3
+            and manifest.get("hostVersion") == "0.3.0"
             and manifest.get("upstreamRevision") == UPSTREAM, "Incompatible core identity.")
     executable = NAME + (".exe" if "windows" in target else "")
     require(manifest.get("executable") == executable, "Unexpected executable name.")
@@ -105,7 +105,7 @@ def assemble(folder, revision, tag=None):
         assets.append(asset)
     version = assets[0]["manifest"]["hostVersion"]
     require(tag is None or tag == "auth-core-v" + version, "Release tag does not match host version.")
-    index = {"schemaVersion": 1, "hostVersion": version, "protocolVersion": 2,
+    index = {"schemaVersion": 1, "hostVersion": version, "protocolVersion": 3,
              "sourceRevision": revision, "upstreamRevision": UPSTREAM, "assets": assets}
     index_path = folder / "release-manifest.json"
     write_json(index_path, index)

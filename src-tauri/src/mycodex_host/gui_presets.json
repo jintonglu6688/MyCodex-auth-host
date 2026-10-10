@@ -1,6 +1,6 @@
 {
   "source": "src/config/codexProviderPresets.ts",
-  "sourceSha256": "b2ff523c47fe613e1929bd789c7907f937059bce8516bf199838f781665f3ff9",
+  "sourceSha256": "450e4425563bbec960755be6f5df13289160575deee0900fcccb1f30e9bc7708",
   "presets": [
     {
       "name": "OpenAI Official",
@@ -19,9 +19,112 @@
       "iconColor": "#00A67E"
     },
     {
+      "name": "GitHub Copilot",
+      "websiteUrl": "https://github.com/features/copilot",
+      "auth": {},
+      "config": "model_provider = \"custom\"\nmodel = \"gpt-6-astra\"\nmodel_reasoning_effort = \"high\"\ndisable_response_storage = true\n\n[model_providers.custom]\nname = \"github-copilot\"\nbase_url = \"https://api.githubcopilot.com\"\nwire_api = \"responses\"\nrequires_openai_auth = false",
+      "endpointCandidates": [
+        "https://api.githubcopilot.com"
+      ],
+      "apiFormat": "openai_chat",
+      "providerType": "github_copilot",
+      "requiresOAuth": true,
+      "modelCatalog": [
+        {
+          "model": "gpt-6-astra",
+          "displayName": "GPT-6 Astra",
+          "contextWindow": 272000,
+          "supportsParallelToolCalls": true,
+          "inputModalities": [
+            "text"
+          ],
+          "reasoningLevels": [
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max"
+          ]
+        },
+        {
+          "model": "gpt-5.6-sol",
+          "displayName": "GPT-5.6 Sol",
+          "contextWindow": 272000,
+          "supportsParallelToolCalls": true,
+          "inputModalities": [
+            "text"
+          ],
+          "reasoningLevels": [
+            "none",
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max"
+          ]
+        },
+        {
+          "model": "gpt-5.6-terra",
+          "displayName": "GPT-5.6 Terra",
+          "contextWindow": 272000,
+          "supportsParallelToolCalls": true,
+          "inputModalities": [
+            "text"
+          ],
+          "reasoningLevels": [
+            "none",
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max"
+          ]
+        },
+        {
+          "model": "gpt-5.6-luna",
+          "displayName": "GPT-5.6 Luna",
+          "contextWindow": 200000,
+          "supportsParallelToolCalls": true,
+          "inputModalities": [
+            "text"
+          ],
+          "reasoningLevels": [
+            "none",
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max"
+          ]
+        },
+        {
+          "model": "gpt-5.5",
+          "displayName": "GPT-5.5",
+          "contextWindow": 272000,
+          "supportsParallelToolCalls": true,
+          "inputModalities": [
+            "text"
+          ],
+          "reasoningLevels": [
+            "none",
+            "low",
+            "medium",
+            "high",
+            "xhigh"
+          ]
+        }
+      ],
+      "category": "third_party",
+      "icon": "github",
+      "iconColor": "#000000"
+    },
+    {
       "name": "Kimi",
+      "family": "kimi",
+      "planKey": "payg",
+      "regionKey": "cn",
       "primePartner": true,
-      "websiteUrl": "https://platform.kimi.com?aff=cc-switch",
+      "websiteUrl": "https://platform.kimi.com?track_id=track-7cf2b91dcde043eda6ef9a95951a042c&aff=cc-switch",
       "apiKeyUrl": "https://platform.kimi.com/console/api-keys?aff=cc-switch",
       "auth": {
         "OPENAI_API_KEY": ""
@@ -60,7 +163,10 @@
     },
     {
       "name": "Kimi Global",
-      "websiteUrl": "https://platform.kimi.ai?aff=cc-switch",
+      "family": "kimi",
+      "planKey": "payg",
+      "regionKey": "intl",
+      "websiteUrl": "https://platform.kimi.ai?track_id=track-674ed6e2af924a5682a87421f7cf753a&aff=cc-switch",
       "apiKeyUrl": "https://platform.kimi.ai/console/api-keys?aff=cc-switch",
       "auth": {
         "OPENAI_API_KEY": ""
@@ -99,6 +205,9 @@
     },
     {
       "name": "Kimi For Coding",
+      "family": "kimi",
+      "planKey": "coding",
+      "regionKey": "cn",
       "primePartner": true,
       "websiteUrl": "https://www.kimi.com/code/?aff=cc-switch",
       "apiKeyUrl": "https://www.kimi.com/code/?aff=cc-switch",
@@ -167,6 +276,9 @@
     },
     {
       "name": "Kimi For Coding Global",
+      "family": "kimi",
+      "planKey": "coding",
+      "regionKey": "intl",
       "websiteUrl": "https://www.kimi.ai/code?aff=cc-switch",
       "apiKeyUrl": "https://www.kimi.ai/code?aff=cc-switch",
       "auth": {
@@ -510,6 +622,23 @@
       "icon": "fluxa"
     },
     {
+      "name": "88API",
+      "websiteUrl": "https://88api.ai",
+      "apiKeyUrl": "https://88api.ai/sign-up?aff=HSGY",
+      "category": "aggregator",
+      "auth": {
+        "OPENAI_API_KEY": ""
+      },
+      "config": "model_provider = \"custom\"\nmodel = \"gpt-5.6-sol\"\nmodel_reasoning_effort = \"high\"\ndisable_response_storage = true\n\n[model_providers.custom]\nname = \"88api\"\nbase_url = \"https://api.88api.ai/v1\"\nwire_api = \"responses\"\nrequires_openai_auth = true",
+      "endpointCandidates": [
+        "https://api.88api.ai/v1",
+        "https://88api.ai/v1"
+      ],
+      "isPartner": true,
+      "partnerPromotionKey": "88api",
+      "icon": "88api"
+    },
+    {
       "name": "APIKEY.FUN",
       "websiteUrl": "https://apikey.fan",
       "apiKeyUrl": "https://apikey.fan/register?aff=CCSwitch",
@@ -629,6 +758,8 @@
     },
     {
       "name": "火山 Agent Plan",
+      "family": "volcengine",
+      "planKey": "agentPlan",
       "websiteUrl": "https://www.volcengine.com/activity/agentplan?ac=MMAP8JTTCAQ2&rc=6J6FV5N2&utm_source=OWO&utm_medium=devrel-1&utm_campaign=hw&utm_term=ccswitch&utm_content=hw",
       "apiKeyUrl": "https://www.volcengine.com/activity/agentplan?ac=MMAP8JTTCAQ2&rc=6J6FV5N2&utm_source=OWO&utm_medium=devrel-1&utm_campaign=hw&utm_term=ccswitch&utm_content=hw",
       "auth": {
@@ -659,6 +790,8 @@
     },
     {
       "name": "火山 Coding Plan",
+      "family": "volcengine",
+      "planKey": "codingPlan",
       "websiteUrl": "https://www.volcengine.com/activity/codingplan?ac=MMAP8JTTCAQ2&rc=6J6FV5N2&utm_campaign=hw&utm_content=ccswitch&utm_medium=devrel_tool_web&utm_source=OWO&utm_term=ccswitch",
       "apiKeyUrl": "https://www.volcengine.com/activity/codingplan?ac=MMAP8JTTCAQ2&rc=6J6FV5N2&utm_campaign=hw&utm_content=ccswitch&utm_medium=devrel_tool_web&utm_source=OWO&utm_term=ccswitch",
       "auth": {
@@ -719,6 +852,8 @@
     },
     {
       "name": "Volcengine Doubao",
+      "family": "volcengine",
+      "planKey": "payg",
       "nameKey": "providerForm.presets.doubaoseed",
       "websiteUrl": "https://console.volcengine.com/ark/region:ark+cn-beijing/apiKey?apikey=%7B%7D&utm_campaign=hw&utm_content=ccswitch&utm_medium=devrel_tool_web&utm_source=OWO&utm_term=ccswitch",
       "apiKeyUrl": "https://console.volcengine.com/ark/region:ark+cn-beijing/apiKey?apikey=%7B%7D&utm_campaign=hw&utm_content=ccswitch&utm_medium=devrel_tool_web&utm_source=OWO&utm_term=ccswitch",
@@ -751,6 +886,8 @@
     },
     {
       "name": "SiliconFlow",
+      "family": "siliconflow",
+      "regionKey": "cn",
       "websiteUrl": "https://siliconflow.cn",
       "apiKeyUrl": "https://cloud.siliconflow.cn/i/YflgU2Ve",
       "auth": {
@@ -792,6 +929,8 @@
     },
     {
       "name": "SiliconFlow en",
+      "family": "siliconflow",
+      "regionKey": "intl",
       "websiteUrl": "https://siliconflow.com",
       "apiKeyUrl": "https://cloud.siliconflow.cn/i/YflgU2Ve",
       "auth": {
@@ -837,6 +976,8 @@
     },
     {
       "name": "Compshare",
+      "family": "compshare",
+      "planKey": "payg",
       "nameKey": "providerForm.presets.ucloud",
       "websiteUrl": "https://www.compshare.cn",
       "apiKeyUrl": "https://www.compshare.cn/coding-plan?ytag=GPU_YY_YX_git_cc-switch",
@@ -855,6 +996,8 @@
     },
     {
       "name": "Compshare Coding Plan",
+      "family": "compshare",
+      "planKey": "codingPlan",
       "nameKey": "providerForm.presets.ucloudCoding",
       "websiteUrl": "https://www.compshare.cn",
       "apiKeyUrl": "https://www.compshare.cn/coding-plan?ytag=GPU_YY_YX_git_cc-switch",
@@ -954,23 +1097,6 @@
       "iconColor": "#E96B2C"
     },
     {
-      "name": "ETok.ai",
-      "websiteUrl": "https://etok.ai",
-      "apiKeyUrl": "https://etok.ai",
-      "auth": {
-        "OPENAI_API_KEY": ""
-      },
-      "config": "model_provider = \"custom\"\nmodel = \"gpt-5.6-sol\"\nmodel_reasoning_effort = \"high\"\ndisable_response_storage = true\n\n[model_providers.custom]\nname = \"etok\"\nbase_url = \"https://api.etok.ai/v1\"\nwire_api = \"responses\"\nrequires_openai_auth = true",
-      "endpointCandidates": [
-        "https://api.etok.ai/v1"
-      ],
-      "category": "third_party",
-      "isPartner": true,
-      "partnerPromotionKey": "etok",
-      "icon": "etok",
-      "iconColor": "#000000"
-    },
-    {
       "name": "Cubence",
       "websiteUrl": "https://cubence.com",
       "apiKeyUrl": "https://cubence.com/signup?code=CCSWITCH&source=ccs",
@@ -1018,10 +1144,12 @@
         "https://www.dmxapi.cn/v1"
       ],
       "isPartner": true,
-      "partnerPromotionKey": "dmxapi"
+      "partnerPromotionKey": "dmxapi",
+      "icon": "dmxapi"
     },
     {
       "name": "SudoCode.chat",
+      "family": "sudocode",
       "websiteUrl": "https://sudocode.chat",
       "apiKeyUrl": "https://sudocode.chat/sign-up?aff=CC-SWITCH&utm_source=cc-switch&utm_medium=sponsor&utm_campaign=ccswitch",
       "category": "third_party",
@@ -1040,6 +1168,7 @@
     },
     {
       "name": "SudoCode.us",
+      "family": "sudocode",
       "websiteUrl": "https://sudocode.us",
       "apiKeyUrl": "https://sudocode.us",
       "category": "third_party",
@@ -1071,6 +1200,24 @@
       "isPartner": true,
       "partnerPromotionKey": "xycai",
       "icon": "xycai"
+    },
+    {
+      "name": "Tu-zi",
+      "nameKey": "providerForm.presets.tuzi",
+      "websiteUrl": "https://api.tu-zi.com",
+      "apiKeyUrl": "https://api.tu-zi.com/token",
+      "category": "aggregator",
+      "auth": {
+        "OPENAI_API_KEY": ""
+      },
+      "config": "model_provider = \"custom\"\nmodel = \"gpt-5.6-sol\"\nmodel_reasoning_effort = \"high\"\ndisable_response_storage = true\n\n[model_providers.custom]\nname = \"tuzi\"\nbase_url = \"https://api.tu-zi.com/v1\"\nwire_api = \"responses\"\nrequires_openai_auth = true",
+      "endpointCandidates": [
+        "https://api.tu-zi.com/v1",
+        "https://api.ourzhishi.top/v1",
+        "https://api.sydney-ai.com/v1",
+        "https://apicdn.tu-zi.com/v1"
+      ],
+      "icon": "tuzi"
     },
     {
       "name": "Amux",
@@ -1199,6 +1346,8 @@
     },
     {
       "name": "Zhipu GLM",
+      "family": "zhipu",
+      "regionKey": "cn",
       "websiteUrl": "https://open.bigmodel.cn",
       "apiKeyUrl": "https://www.bigmodel.cn/claude-code?ic=RRVJPB5SII",
       "auth": {
@@ -1260,6 +1409,8 @@
     },
     {
       "name": "Zhipu GLM en",
+      "family": "zhipu",
+      "regionKey": "intl",
       "websiteUrl": "https://z.ai",
       "apiKeyUrl": "https://z.ai/subscribe?ic=8JVLJQFSKB",
       "auth": {
@@ -1309,6 +1460,8 @@
     },
     {
       "name": "Baidu Qianfan",
+      "family": "baidu-qianfan",
+      "planKey": "payg",
       "websiteUrl": "https://cloud.baidu.com/product/qianfan_modelbuilder",
       "apiKeyUrl": "https://console.bce.baidu.com/qianfan/ais/console/applicationConsole/application",
       "auth": {
@@ -1349,6 +1502,8 @@
     },
     {
       "name": "Baidu Qianfan Coding Plan",
+      "family": "baidu-qianfan",
+      "planKey": "codingPlan",
       "websiteUrl": "https://cloud.baidu.com/product/qianfan_modelbuilder",
       "apiKeyUrl": "https://console.bce.baidu.com/qianfan/ais/console/applicationConsole/application",
       "auth": {
@@ -1383,6 +1538,8 @@
     },
     {
       "name": "Baidu Qianfan Token Plan",
+      "family": "baidu-qianfan",
+      "planKey": "tokenPlan",
       "websiteUrl": "https://cloud.baidu.com/product/codingplan.html",
       "apiKeyUrl": "https://console.bce.baidu.com/qianfan/resource/token-plan",
       "auth": {
@@ -1462,6 +1619,8 @@
     },
     {
       "name": "千问AI平台",
+      "family": "qianwen",
+      "planKey": "payg",
       "websiteUrl": "https://platform.qianwenai.com/?utm_content=g_20000002971",
       "apiKeyUrl": "https://platform.qianwenai.com/home/api-keys?utm_content=g_20000002972",
       "auth": {
@@ -1523,6 +1682,8 @@
     },
     {
       "name": "千问AI平台 Token Plan",
+      "family": "qianwen",
+      "planKey": "tokenPlan",
       "websiteUrl": "https://platform.qianwenai.com/pricing/token-plan?utm_content=g_20000002977",
       "apiKeyUrl": "https://platform.qianwenai.com/home/api-keys?utm_content=g_20000002978",
       "auth": {
@@ -1565,6 +1726,8 @@
     },
     {
       "name": "QwenCloud",
+      "family": "qwencloud",
+      "planKey": "payg",
       "websiteUrl": "https://home.qwencloud.com/?utm_content=g_20000002974",
       "apiKeyUrl": "https://home.qwencloud.com/api-keys?utm_content=g_20000002975",
       "auth": {
@@ -1646,6 +1809,8 @@
     },
     {
       "name": "QwenCloud For Coding",
+      "family": "qwencloud",
+      "planKey": "coding",
       "websiteUrl": "https://www.qwencloud.com",
       "apiKeyUrl": "https://home.qwencloud.com/api-keys",
       "auth": {
@@ -1682,6 +1847,8 @@
     },
     {
       "name": "QwenCloud Token Plan",
+      "family": "qwencloud",
+      "planKey": "tokenPlan",
       "websiteUrl": "https://www.qwencloud.com/pricing/token-plan?utm_content=g_20000002980",
       "apiKeyUrl": "https://home.qwencloud.com/api-keys?utm_content=g_20000002981",
       "auth": {
@@ -1732,6 +1899,9 @@
     },
     {
       "name": "Tencent Hunyuan",
+      "family": "tencent",
+      "planKey": "payg",
+      "regionKey": "cn",
       "websiteUrl": "https://cloud.tencent.com/product/tokenhub",
       "apiKeyUrl": "https://console.cloud.tencent.com/tokenhub/apikey",
       "auth": {
@@ -1788,6 +1958,9 @@
     },
     {
       "name": "Tencent Token Plan",
+      "family": "tencent",
+      "planKey": "tokenPlan",
+      "regionKey": "cn",
       "websiteUrl": "https://cloud.tencent.com/product/tokenhub",
       "apiKeyUrl": "https://console.cloud.tencent.com/tokenhub/tokenplan",
       "auth": {
@@ -1899,6 +2072,9 @@
     },
     {
       "name": "Tencent Token Plan (Intl)",
+      "family": "tencent",
+      "planKey": "tokenPlan",
+      "regionKey": "intl",
       "websiteUrl": "https://www.tencentcloud.com/products/tokenhub",
       "apiKeyUrl": "https://console.tencentcloud.com/tokenhub/tokenplan",
       "auth": {
@@ -1978,6 +2154,9 @@
     },
     {
       "name": "Tencent Token Plan Enterprise Pro",
+      "family": "tencent",
+      "planKey": "enterprisePro",
+      "regionKey": "cn",
       "websiteUrl": "https://cloud.tencent.com/product/tokenhub",
       "apiKeyUrl": "https://console.cloud.tencent.com/tokenhub/tokenplan-e",
       "auth": {
@@ -2173,6 +2352,9 @@
     },
     {
       "name": "Tencent Token Plan Enterprise Pro (Intl)",
+      "family": "tencent",
+      "planKey": "enterprisePro",
+      "regionKey": "intl",
       "websiteUrl": "https://www.tencentcloud.com/products/tokenhub",
       "apiKeyUrl": "https://console.tencentcloud.com/tokenhub/tokenplan-e",
       "auth": {
@@ -2325,6 +2507,9 @@
     },
     {
       "name": "Tencent Token Plan Enterprise Lite",
+      "family": "tencent",
+      "planKey": "enterpriseLite",
+      "regionKey": "cn",
       "websiteUrl": "https://cloud.tencent.com/product/tokenhub",
       "apiKeyUrl": "https://console.cloud.tencent.com/tokenhub/tokenplan-e",
       "auth": {
@@ -2359,6 +2544,9 @@
     },
     {
       "name": "Tencent Token Plan Enterprise Lite (Intl)",
+      "family": "tencent",
+      "planKey": "enterpriseLite",
+      "regionKey": "intl",
       "websiteUrl": "https://www.tencentcloud.com/products/tokenhub",
       "apiKeyUrl": "https://console.tencentcloud.com/tokenhub/tokenplan-e",
       "auth": {
@@ -2394,6 +2582,9 @@
     },
     {
       "name": "StepFun API",
+      "family": "stepfun",
+      "planKey": "payg",
+      "regionKey": "cn",
       "websiteUrl": "https://platform.stepfun.com",
       "apiKeyUrl": "https://platform.stepfun.com/interface-key",
       "auth": {
@@ -2427,6 +2618,9 @@
     },
     {
       "name": "StepFun API en",
+      "family": "stepfun",
+      "planKey": "payg",
+      "regionKey": "intl",
       "websiteUrl": "https://platform.stepfun.ai",
       "apiKeyUrl": "https://platform.stepfun.ai/interface-key",
       "auth": {
@@ -2460,6 +2654,9 @@
     },
     {
       "name": "StepFun",
+      "family": "stepfun",
+      "planKey": "stepPlan",
+      "regionKey": "cn",
       "websiteUrl": "https://platform.stepfun.com/step-plan",
       "apiKeyUrl": "https://platform.stepfun.com/interface-key",
       "auth": {
@@ -2502,6 +2699,9 @@
     },
     {
       "name": "StepFun en",
+      "family": "stepfun",
+      "planKey": "stepPlan",
+      "regionKey": "intl",
       "websiteUrl": "https://platform.stepfun.ai/step-plan",
       "apiKeyUrl": "https://platform.stepfun.ai/interface-key",
       "auth": {
@@ -2600,6 +2800,8 @@
     },
     {
       "name": "MiniMax",
+      "family": "minimax",
+      "regionKey": "cn",
       "websiteUrl": "https://platform.minimax.cn",
       "apiKeyUrl": "https://platform.minimax.cn/subscribe/token-plan",
       "auth": {
@@ -2637,6 +2839,8 @@
     },
     {
       "name": "MiniMax en",
+      "family": "minimax",
+      "regionKey": "intl",
       "websiteUrl": "https://platform.minimax.io",
       "apiKeyUrl": "https://platform.minimax.io/subscribe/coding-plan",
       "auth": {
@@ -2698,7 +2902,8 @@
           "defaultReasoningLevel": "high"
         }
       ],
-      "category": "cn_official"
+      "category": "cn_official",
+      "icon": "astron"
     },
     {
       "name": "BaiLing",
@@ -2719,10 +2924,13 @@
           "contextWindow": 262144
         }
       ],
-      "category": "cn_official"
+      "category": "cn_official",
+      "icon": "bailing"
     },
     {
       "name": "Xiaomi MiMo",
+      "family": "xiaomi-mimo",
+      "planKey": "payg",
       "websiteUrl": "https://platform.xiaomimimo.com",
       "apiKeyUrl": "https://platform.xiaomimimo.com/#/console/api-keys",
       "auth": {
@@ -2830,6 +3038,8 @@
     },
     {
       "name": "Xiaomi MiMo Token Plan (China)",
+      "family": "xiaomi-mimo",
+      "planKey": "tokenPlan",
       "websiteUrl": "https://platform.xiaomimimo.com/#/token-plan",
       "apiKeyUrl": "https://platform.xiaomimimo.com/#/console/plan-manage",
       "auth": {
@@ -3078,8 +3288,10 @@
     },
     {
       "name": "OpenCode Go",
+      "family": "opencode",
+      "planKey": "coding",
       "websiteUrl": "https://opencode.ai/go",
-      "apiKeyUrl": "https://opencode.ai/go?ref=2YTRG2NGTX",
+      "apiKeyUrl": "https://opencode.ai/go",
       "partnerPromotionKey": "opencode_go",
       "auth": {
         "OPENAI_API_KEY": ""
@@ -3169,6 +3381,23 @@
       "iconColor": "#211E1E"
     },
     {
+      "name": "OpenCode Zen",
+      "family": "opencode",
+      "planKey": "payg",
+      "websiteUrl": "https://opencode.ai/zen",
+      "apiKeyUrl": "https://opencode.ai/auth",
+      "auth": {
+        "OPENAI_API_KEY": ""
+      },
+      "config": "model_provider = \"custom\"\nmodel = \"gpt-6-sol\"\nmodel_reasoning_effort = \"high\"\ndisable_response_storage = true\n\n[model_providers.custom]\nname = \"opencode_zen\"\nbase_url = \"https://opencode.ai/zen/v1\"\nwire_api = \"responses\"\nrequires_openai_auth = true",
+      "endpointCandidates": [
+        "https://opencode.ai/zen/v1"
+      ],
+      "category": "aggregator",
+      "icon": "opencode",
+      "iconColor": "#211E1E"
+    },
+    {
       "name": "AiHubMix",
       "websiteUrl": "https://aihubmix.com",
       "category": "aggregator",
@@ -3215,7 +3444,7 @@
       "auth": {
         "OPENAI_API_KEY": ""
       },
-      "config": "model_provider = \"custom\"\nmodel = \"gpt-5.6-sol\"\nmodel_reasoning_effort = \"high\"\ndisable_response_storage = true\npersonality = \"pragmatic\"\n\n[model_providers.custom]\nname = \"E-FlowCode\"\nbase_url = \"https://e-flowcode.cc/v1\"\nwire_api = \"responses\"\nrequires_openai_auth = true\nmodel_context_window = 1000000\nmodel_auto_compact_token_limit = 9000000",
+      "config": "model_provider = \"custom\"\nmodel = \"gpt-5.6-sol\"\nmodel_reasoning_effort = \"high\"\ndisable_response_storage = true\n\n[model_providers.custom]\nname = \"E-FlowCode\"\nbase_url = \"https://e-flowcode.cc/v1\"\nwire_api = \"responses\"\nrequires_openai_auth = true\nmodel_context_window = 1000000\nmodel_auto_compact_token_limit = 9000000",
       "category": "third_party",
       "endpointCandidates": [
         "https://e-flowcode.cc/v1"
@@ -3260,7 +3489,8 @@
       "endpointCandidates": [
         "https://api.therouter.ai/v1"
       ],
-      "category": "aggregator"
+      "category": "aggregator",
+      "icon": "therouter"
     },
     {
       "name": "JieKou AI",
@@ -3303,6 +3533,127 @@
       "category": "aggregator",
       "icon": "aicodewith",
       "iconColor": "#3A3B40"
+    },
+    {
+      "name": "Command Code",
+      "websiteUrl": "https://commandcode.ai",
+      "apiKeyUrl": "https://commandcode.ai/settings/keys",
+      "auth": {
+        "OPENAI_API_KEY": ""
+      },
+      "config": "model_provider = \"custom\"\nmodel = \"deepseek/deepseek-v4.1-flash\"\nmodel_reasoning_effort = \"high\"\ndisable_response_storage = true\n\n[model_providers.custom]\nname = \"command_code\"\nbase_url = \"https://api.commandcode.ai/provider/v1\"\nwire_api = \"responses\"\nrequires_openai_auth = true",
+      "endpointCandidates": [
+        "https://api.commandcode.ai/provider/v1"
+      ],
+      "apiFormat": "openai_responses",
+      "modelCatalog": [
+        {
+          "model": "deepseek/deepseek-v4.1-flash",
+          "displayName": "DeepSeek V4.1 Flash",
+          "contextWindow": 1000000
+        },
+        {
+          "model": "z-ai/glm-5.3-flash",
+          "displayName": "GLM-5.3 Flash",
+          "contextWindow": 1048576
+        },
+        {
+          "model": "Qwen/Qwen3.8-Flash",
+          "displayName": "Qwen 3.8 Flash",
+          "contextWindow": 1000000
+        }
+      ],
+      "category": "third_party",
+      "icon": "commandcode"
+    },
+    {
+      "name": "模力方舟",
+      "websiteUrl": "https://moark.com",
+      "apiKeyUrl": "https://moark.com/dashboard/tokens",
+      "auth": {
+        "OPENAI_API_KEY": ""
+      },
+      "config": "model_provider = \"custom\"\nmodel = \"deepseek-v4-flash-0731\"\nmodel_reasoning_effort = \"high\"\ndisable_response_storage = true\n\n[model_providers.custom]\nname = \"moark\"\nbase_url = \"https://moark.com/v1\"\nwire_api = \"responses\"\nrequires_openai_auth = true",
+      "endpointCandidates": [
+        "https://moark.com/v1"
+      ],
+      "apiFormat": "openai_responses",
+      "modelCatalog": [
+        {
+          "model": "deepseek-v4-flash-0731",
+          "displayName": "DeepSeek V4 Flash",
+          "contextWindow": 1000000,
+          "inputModalities": [
+            "text"
+          ],
+          "reasoningLevels": [
+            "low",
+            "high",
+            "max"
+          ]
+        },
+        {
+          "model": "DeepSeek-V4-Pro",
+          "displayName": "DeepSeek V4 Pro",
+          "contextWindow": 1000000,
+          "inputModalities": [
+            "text"
+          ],
+          "reasoningLevels": [
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max"
+          ]
+        },
+        {
+          "model": "GLM-5.3",
+          "displayName": "GLM-5.3",
+          "contextWindow": 1048576,
+          "inputModalities": [
+            "text"
+          ],
+          "reasoningLevels": [
+            "none",
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max"
+          ]
+        },
+        {
+          "model": "Kimi-K2.7-Code",
+          "displayName": "Kimi K2.7 Code",
+          "contextWindow": 262144,
+          "inputModalities": [
+            "text",
+            "image"
+          ],
+          "reasoningLevels": [
+            "none",
+            "minimal",
+            "low",
+            "medium",
+            "high",
+            "xhigh"
+          ]
+        },
+        {
+          "model": "qwen3-coder-plus",
+          "displayName": "Qwen3 Coder Plus",
+          "contextWindow": 1000000,
+          "inputModalities": [
+            "text"
+          ],
+          "reasoningLevels": [
+            "none"
+          ]
+        }
+      ],
+      "category": "aggregator",
+      "icon": "moark"
     }
   ]
 }

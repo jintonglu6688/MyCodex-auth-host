@@ -147,8 +147,12 @@ impl CodexProjection {
             )
         })?;
 
+        // MyCodex: Codex ignores the legacy `disable_response_storage` setting; a
+        // headless host leaves it unmanaged and removes it before Codex starts.
+        let host = crate::mycodex_host::runtime_paths().is_some();
         let mut top: Vec<(String, TomlValue)> = ROW_TOP_FIELDS
             .iter()
+            .filter(|key| !(host && **key == "disable_response_storage"))
             .filter_map(|key| {
                 let value = doc.get(key)?.as_value()?.clone();
                 Some(((*key).to_string(), undecorated(value)))
@@ -501,6 +505,12 @@ pub fn proxy_route_table(name: &str, base_url: &str, requires_openai_auth: bool)
     );
     if requires_openai_auth {
         table.insert("requires_openai_auth", toml_edit::value(true));
+    }
+    // MyCodex: a headless host admits only requests carrying its route credential.
+    if let Some((header, token)) = crate::mycodex_host::lifecycle::route_credential() {
+        let mut headers = Table::new();
+        headers.insert(header, toml_edit::value(token));
+        table.insert("http_headers", Item::Table(headers));
     }
     table
 }

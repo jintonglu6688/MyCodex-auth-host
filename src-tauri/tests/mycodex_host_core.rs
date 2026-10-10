@@ -1,17 +1,22 @@
 //! Process-boundary checks using only temporary files and synthetic credentials.
+//!
+//! The migration tests need a released v3 host to create old stores. Set
+//! `MYCODEX_V3_HOST` to a verified 0.2.3 `mycodex-auth-host` executable; without
+//! it those tests only report that they were skipped.
 use serde_json::{json, Value};
 use std::fs;
-use std::io::Write;
-use std::path::PathBuf;
-use std::process::{Command, Output, Stdio};
+use std::io::{BufRead, Read, Write};
+use std::path::{Path, PathBuf};
+use std::process::{Child, Command, Output, Stdio};
 use tempfile::TempDir;
+
+const HEADER: &str = "x-mycodex-route-token";
 
 struct Probe {
     root: TempDir,
     data: PathBuf,
     codex: PathBuf,
     unrelated: PathBuf,
-    resident: bool,
 }
 
 impl Probe {
@@ -28,14 +33,14 @@ impl Probe {
             data,
             codex,
             unrelated,
-            resident: false,
         }
     }
 
-    fn raw(&self, input: &[u8], target: &std::path::Path) -> Output {
-        let mut child = Command::new(env!("CARGO_BIN_EXE_mycodex-auth-host"))
-            .args([if self.resident { "rpc" } else { "request" }, "--data-dir"])
-            .arg(&self.data)
+    fn command(&self, executable: &Path, mode: &str, data: &Path, target: &Path) -> Command {
+        let mut command = Command::new(executable);
+        command
+            .args([mode, "--data-dir"])
+            .arg(data)
             .arg("--codex-home")
             .arg(target)
             .env("CC_SWITCH_TEST_HOME", &self.unrelated)
@@ -45,7 +50,17 @@ impl Probe {
             .env("CODEX_HOME", &self.unrelated)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
+            .stderr(Stdio::piped());
+        command
+    }
+
+    fn host() -> &'static Path {
+        Path::new(env!("CARGO_BIN_EXE_mycodex-auth-host"))
+    }
+
+    fn exchange(&self, executable: &Path, input: &[u8], target: &Path) -> Output {
+        let mut child = self
+            .command(executable, "rpc", &self.data, target)
             .spawn()
             .unwrap();
         child.stdin.take().unwrap().write_all(input).unwrap();
@@ -56,19 +71,23 @@ impl Probe {
         assert_eq!(
             fs::read_dir(&self.unrelated).unwrap().count(),
             0,
-            "explicit target must cover settings, DB and Codex paths"
+            "explicit target must cover settings, DB, device state and Codex paths"
         );
         output
     }
 
-    fn call(&self, method: &str, params: Value) -> Value {
+    fn raw(&self, input: &[u8], target: &Path) -> Output {
+        self.exchange(Self::host(), input, target)
+    }
+
+    fn call_with(&self, executable: &Path, method: &str, params: Value) -> Value {
         let input =
             serde_json::to_vec(&json!({"jsonrpc":"2.0","id":1,"method":method,"params":params}))
                 .unwrap();
-        let output = self.raw(&input, &self.codex);
+        let output = self.exchange(executable, &input, &self.codex);
         assert!(
             output.status.success(),
-            "{}",
+            "{method}: {}",
             String::from_utf8_lossy(&output.stderr)
         );
         let response: Value = serde_json::from_slice(&output.stdout).unwrap();
@@ -76,18 +95,52 @@ impl Probe {
         response
     }
 
+    fn call(&self, method: &str, params: Value) -> Value {
+        self.call_with(Self::host(), method, params)
+    }
+
     fn ok(&self, method: &str, params: Value) -> Value {
         let response = self.call(method, params);
-        assert!(response.get("error").is_none(), "{response}");
+        assert!(response.get("error").is_none(), "{method}: {response}");
         response["result"].clone()
     }
 
-    fn add(&self, provider: Value) {
-        self.ok("provider/add", json!({"provider":provider}));
+    /// Exit output of a `serve` that is expected to fail before becoming ready.
+    fn serve_failure(&self, data: &Path, target: &Path) -> String {
+        let output = self
+            .command(Self::host(), "serve", data, target)
+            .stdin(Stdio::null())
+            .output()
+            .unwrap();
+        assert!(!output.status.success());
+        assert!(output.stdout.is_empty(), "unexpected ready line");
+        String::from_utf8_lossy(&output.stderr).trim().to_string()
     }
 
-    fn switch(&self, id: &str) {
-        self.ok("provider/switch", json!({"providerId":id}));
+    fn save(&self, params: Value) -> Value {
+        self.ok("gui/provider/save", params)
+    }
+
+    fn apply(&self, id: &str) {
+        let response = self.try_apply(id);
+        assert!(response.get("error").is_none(), "apply {id}: {response}");
+    }
+
+    fn try_apply(&self, id: &str) -> Value {
+        let selected = self.ok("gui/provider/get", json!({"providerId":id}));
+        let preflight = self.call(
+            "gui/provider/preflight",
+            json!({"providerId":id,"expectedVersion":selected["version"]}),
+        );
+        if preflight.get("error").is_some() {
+            return preflight;
+        }
+        let operation = format!("apply-{id}-{}", uuid_like());
+        self.call(
+            "gui/provider/apply",
+            json!({"providerId":id,"expectedVersion":selected["version"],
+                "expectedFingerprint":preflight["result"]["fingerprint"],"operationId":operation}),
+        )
     }
 
     fn live_text(&self) -> String {
@@ -100,59 +153,53 @@ impl Probe {
 
     fn route_token(&self) -> String {
         let live = self.live();
-        let source = live["model_provider"].as_str().unwrap();
-        live["model_providers"][source]["http_headers"]["x-mycodex-route-token"]
+        assert_eq!(live["model_provider"].as_str(), Some("custom"), "{live}");
+        live["model_providers"]["custom"]["http_headers"][HEADER]
             .as_str()
             .unwrap()
             .to_string()
     }
+
+    fn route(&self) -> Value {
+        self.ok("status", json!({}))["route"].clone()
+    }
 }
 
-fn api(id: &str, model: &str, shared: bool) -> Value {
-    json!({"id":id,"name":id,"category":"custom",
-        "meta":{"commonConfigEnabled":shared,"apiFormat":"openai_responses"},
-        "settingsConfig":{"auth":{"OPENAI_API_KEY":format!("synthetic-secret-{id}")},
-        "config":format!("model = \"{model}\"\nmodel_provider = \"{id}\"\n[model_providers.{id}]\nname = \"{id}\"\nbase_url = \"https://{id}.example.invalid/v1\"\nwire_api = \"responses\"\n")}})
-}
-
-fn account_token(id: &str, generation: u32) -> String {
-    use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
-    let claims = json!({"sub":id,"email":format!("{id}@example.invalid"),"exp":4102444800u64,
-        "generation":generation,"https://api.openai.com/auth":{"chatgpt_account_id":id}});
+fn uuid_like() -> String {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static NEXT: AtomicU32 = AtomicU32::new(0);
     format!(
-        "{}.{}.signature",
-        URL_SAFE_NO_PAD.encode(br#"{"alg":"none"}"#),
-        URL_SAFE_NO_PAD.encode(serde_json::to_vec(&claims).unwrap())
+        "{}-{}",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
     )
 }
 
-fn account(id: &str) -> Value {
-    json!({"id":id,"name":id,"category":"official",
-        "meta":{"commonConfigEnabled":true},
-        "settingsConfig":{"auth":{"auth_mode":"chatgpt","OPENAI_API_KEY":null,
-            "tokens":{"access_token":account_token(id, 1),"id_token":account_token(id, 1),
-                "refresh_token":format!("synthetic-secret-refresh-{id}"),"account_id":id},
-            "last_refresh":"2024-01-01T00:00:00Z"},
-        "config":"model = \"test-model\"\n"}})
+fn form(id: &str, kind: &str, base: &str, model: &str) -> Value {
+    json!({"id":id,"name":id,"kind":kind,"baseUrl":base,"model":model,"presetId":"custom",
+        "apiKey":format!("synthetic-secret-{id}")})
 }
 
-struct Resident(std::process::Child);
+fn direct(id: &str) -> Value {
+    form(
+        id,
+        "responses",
+        &format!("https://{id}.example.invalid/v1"),
+        &format!("{id}-model"),
+    )
+}
+
+struct Resident(Child);
 
 impl Resident {
-    fn start(p: &mut Probe) -> Self {
-        use std::io::BufRead;
-        let mut child = Command::new(env!("CARGO_BIN_EXE_mycodex-auth-host"))
-            .args(["serve", "--data-dir"])
-            .arg(&p.data)
-            .arg("--codex-home")
-            .arg(&p.codex)
-            .env("CC_SWITCH_TEST_HOME", &p.unrelated)
-            .env("HOME", &p.unrelated)
-            .env("USERPROFILE", &p.unrelated)
-            .env("LOCALAPPDATA", &p.unrelated)
+    fn start(p: &Probe) -> Self {
+        Self::start_with(p, Probe::host(), 3)
+    }
+
+    fn start_with(p: &Probe, executable: &Path, protocol: u64) -> Self {
+        let mut child = p
+            .command(executable, "serve", &p.data, &p.codex)
             .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
             .spawn()
             .unwrap();
         let stdout = child.stdout.take().unwrap();
@@ -165,9 +212,8 @@ impl Resident {
             let _ = tx.send(line);
         });
         let mut resident = Self(child);
-        let ready = rx.recv_timeout(std::time::Duration::from_secs(20)).unwrap();
+        let ready = rx.recv_timeout(std::time::Duration::from_secs(30)).unwrap();
         if ready.is_empty() {
-            use std::io::Read;
             let mut error = String::new();
             resident
                 .0
@@ -180,16 +226,22 @@ impl Resident {
         }
         let ready: Value = serde_json::from_str(&ready).unwrap();
         assert_eq!(ready["event"], "ready");
-        assert_eq!(ready["protocolVersion"], 2);
-        assert_eq!(ready["hostVersion"], "0.2.3");
-        assert_eq!(
-            ready["sourceRevision"],
-            env!("MYCODEX_CORE_SOURCE_REVISION")
-        );
+        assert_eq!(ready["protocolVersion"], protocol);
+        if protocol == 3 {
+            assert_eq!(ready["hostVersion"], "0.3.0");
+            assert_eq!(
+                ready["sourceRevision"],
+                env!("MYCODEX_CORE_SOURCE_REVISION")
+            );
+        }
         assert_eq!(ready["codexHome"], json!(p.codex.canonicalize().unwrap()));
         assert_eq!(ready["dataDir"], json!(p.data.canonicalize().unwrap()));
-        p.resident = true;
         resident
+    }
+
+    fn shutdown(mut self, p: &Probe, params: Value) {
+        assert_eq!(p.ok("backend/shutdown", params)["status"], "shutting_down");
+        assert!(self.0.wait().unwrap().success());
     }
 }
 
@@ -200,11 +252,72 @@ impl Drop for Resident {
     }
 }
 
+fn v3_host() -> Option<PathBuf> {
+    let host = std::env::var_os("MYCODEX_V3_HOST").map(PathBuf::from);
+    if host.is_none() {
+        eprintln!("skipped: MYCODEX_V3_HOST is not set");
+    }
+    host
+}
+
+/// A local upstream that answers Chat Completions and Anthropic Messages.
+fn upstream(
+    runtime: &tokio::runtime::Runtime,
+) -> (
+    std::net::SocketAddr,
+    std::sync::mpsc::Receiver<(String, Value)>,
+) {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let address = runtime.block_on(async {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let app = axum::Router::new().fallback(move |request: axum::extract::Request| {
+            let tx = tx.clone();
+            async move {
+                let path = request.uri().path().to_owned();
+                assert!(!request.headers().contains_key(HEADER));
+                let body = axum::body::to_bytes(request.into_body(), 1_000_000)
+                    .await
+                    .unwrap();
+                tx.send((path.clone(), serde_json::from_slice::<Value>(&body).unwrap()))
+                    .unwrap();
+                let response = if path.ends_with("/messages") {
+                    json!({"id":"msg_test","type":"message","role":"assistant","model":"test-model",
+                        "content":[{"type":"text","text":"hello"}],"stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":1}})
+                } else {
+                    json!({"id":"chat_test","object":"chat.completion","created":1,"model":"test-model",
+                        "choices":[{"index":0,"message":{"role":"assistant","content":"hello"},"finish_reason":"stop"}],
+                        "usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}})
+                };
+                axum::Json(response)
+            }
+        });
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        address
+    });
+    (address, rx)
+}
+
+fn route_request(runtime: &tokio::runtime::Runtime, port: u64, token: &str) -> Value {
+    runtime.block_on(async {
+        reqwest::Client::new()
+            .post(format!("http://127.0.0.1:{port}/v1/responses"))
+            .header(HEADER, token)
+            .json(&json!({"model":"test-model","input":"hi","stream":false}))
+            .timeout(std::time::Duration::from_secs(15))
+            .send()
+            .await
+            .unwrap()
+            .json::<Value>()
+            .await
+            .unwrap()
+    })
+}
+
 #[test]
 fn build_identity_is_independent_of_runtime_checkout_and_matches_resident() {
     use sha2::{Digest, Sha256};
-    use std::io::Read;
-    let mut p = Probe::new();
+    let p = Probe::new();
     let executable = env!("CARGO_BIN_EXE_mycodex-auth-host");
     let output = Command::new(executable)
         .arg("--version-json")
@@ -216,8 +329,8 @@ fn build_identity_is_independent_of_runtime_checkout_and_matches_resident() {
         .unwrap();
     assert!(output.status.success());
     let identity: Value = serde_json::from_slice(&output.stdout).unwrap();
-    assert_eq!(identity["protocolVersion"], 2);
-    assert_eq!(identity["hostVersion"], "0.2.3");
+    assert_eq!(identity["protocolVersion"], 3);
+    assert_eq!(identity["hostVersion"], "0.3.0");
     assert_eq!(
         identity["sourceRevision"],
         env!("MYCODEX_CORE_SOURCE_REVISION")
@@ -245,150 +358,122 @@ fn build_identity_is_independent_of_runtime_checkout_and_matches_resident() {
         digest.update(&buffer[..length]);
     }
     assert_eq!(identity["sha256"], format!("{:x}", digest.finalize()));
-    let probe_status = p.ok("status", json!({}));
-    let _resident = Resident::start(&mut p);
-    let resident_status = p.ok("status", json!({}));
+    let resident = Resident::start(&p);
+    let status = p.ok("status", json!({}));
     for (key, expected) in identity.as_object().unwrap() {
-        assert_eq!(probe_status[key], *expected, "probe field {key}");
-        assert_eq!(resident_status[key], *expected, "resident field {key}");
+        assert_eq!(status[key], *expected, "resident field {key}");
     }
-    assert_eq!(
-        resident_status["codexHome"],
-        json!(p.codex.canonicalize().unwrap())
-    );
-    p.ok("backend/shutdown", json!({}));
-}
-
-fn routed(id: &str, format: &str, upstream: &str) -> Value {
-    let mut provider = api(id, "test-model", true);
-    provider["meta"]["apiFormat"] = json!(format);
-    provider["settingsConfig"]["config"] = json!(format!(
-        "model = \"test-model\"\nmodel_provider = \"{id}\"\n[model_providers.{id}]\nname = \"{id}\"\nbase_url = \"{upstream}\"\nwire_api = \"responses\"\n"));
-    provider
+    assert_eq!(status["codexHome"], json!(p.codex.canonicalize().unwrap()));
+    resident.shutdown(&p, json!({}));
 }
 
 #[test]
-fn resident_ipc_account_methods_and_target_lock_use_native_state() {
-    let mut p = Probe::new();
-    let _daemon = Resident::start(&mut p);
-    assert_eq!(p.ok("account/list", json!({}))["accounts"], json!([]));
+fn empty_store_starts_inside_its_target_and_removed_methods_fail_closed() {
+    let p = Probe::new();
+    let resident = Resident::start(&p);
+    let status = p.ok("status", json!({}));
+    assert!(status["capabilities"]
+        .as_array()
+        .unwrap()
+        .contains(&json!("globalAuthCapture")));
+    assert!(!status["capabilities"]
+        .as_array()
+        .unwrap()
+        .contains(&json!("commonConfig")));
+    assert!(status["route"]["mode"] == "direct" || status["route"]["mode"].is_null());
+    assert_eq!(status["route"]["accepting"], false);
+    assert_eq!(status["route"]["takeover"], false);
+    assert_eq!(p.ok("gui/provider/list", json!({}))["providers"], json!([]));
+    for method in [
+        "gui/config/common/get",
+        "gui/config/common/save",
+        "provider/add",
+        "provider/switch",
+        "account/list",
+        "mcp/import",
+    ] {
+        assert_eq!(
+            p.call(method, json!({}))["error"]["message"],
+            "method_not_supported",
+            "{method}"
+        );
+    }
+    resident.shutdown(&p, json!({"forUpdate":true}));
+    assert!(p.data.join("live-state.json").exists());
+}
+
+#[test]
+fn a_second_resident_for_the_same_target_is_refused() {
+    let p = Probe::new();
+    let resident = Resident::start(&p);
+    p.save(direct("native"));
+    let before = p.live_text();
+    // Same store, then a different store claiming the same Codex home.
     assert_eq!(
-        p.ok("account/login/cancel", json!({"deviceCode":"missing"}))["cancelled"],
-        false
-    );
-    assert_eq!(
-        p.call("account/login/poll", json!({"deviceCode":"missing"}))["error"]["message"],
-        "login_failed"
-    );
-    assert_eq!(
-        p.call("account/default", json!({"accountId":"missing"}))["error"]["message"],
-        "account_not_found"
-    );
-    p.add(account("a"));
-    p.add(account("b"));
-    p.switch("b");
-    assert_eq!(p.ok("status", json!({}))["route"]["running"], false);
-    p.resident = false;
-    let output = p.raw(br#"{"jsonrpc":"2.0","id":1,"method":"status"}"#, &p.codex);
-    assert_eq!(
-        String::from_utf8_lossy(&output.stderr).trim(),
+        p.serve_failure(&p.data, &p.codex),
         "backend_already_running"
     );
-    p.resident = true;
-    p.ok("backend/shutdown", json!({}));
+    let other = p.root.path().join("other-store");
+    fs::create_dir(&other).unwrap();
+    assert_eq!(p.serve_failure(&other, &p.codex), "backend_already_running");
+    assert!(!other.join("cc-switch.db").exists());
+    assert_eq!(p.live_text(), before);
+    resident.shutdown(&p, json!({}));
 }
 
 #[test]
-fn resident_routes_chat_and_anthropic_then_restores_direct_accounts() {
+fn resident_routes_chat_and_anthropic_then_returns_direct() {
     let runtime = tokio::runtime::Runtime::new().unwrap();
-    let (tx, rx) = std::sync::mpsc::channel();
-    let address = runtime.block_on(async {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = listener.local_addr().unwrap();
-        let app = axum::Router::new().fallback(move |request: axum::extract::Request| {
-            let tx = tx.clone();
-            async move {
-                let path = request.uri().path().to_owned();
-                assert!(!request.headers().contains_key("x-mycodex-route-token"));
-                let body = axum::body::to_bytes(request.into_body(), 1_000_000).await.unwrap();
-                tx.send((path.clone(), serde_json::from_slice::<Value>(&body).unwrap())).unwrap();
-                let response = if path.ends_with("/messages") {
-                    json!({"id":"msg_test","type":"message","role":"assistant","model":"test-model",
-                        "content":[{"type":"text","text":"hello"}],"stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":1}})
-                } else {
-                    json!({"id":"chat_test","object":"chat.completion","created":1,"model":"test-model",
-                        "choices":[{"index":0,"message":{"role":"assistant","content":"hello"},"finish_reason":"stop"}],
-                        "usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}})
-                };
-                axum::Json(response)
-            }
-        });
-        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-        address
-    });
-    let mut p = Probe::new();
-    let daemon = Resident::start(&mut p);
-    p.add(routed(
-        "chat",
-        "openai_chat",
-        &format!("http://{address}/v1"),
-    ));
-    p.add(routed(
-        "anthropic",
-        "anthropic",
-        &format!("http://{address}/v1"),
-    ));
-    p.add(account("official"));
-    p.add(api("native", "native-model", true));
+    let (address, rx) = upstream(&runtime);
+    let p = Probe::new();
+    let daemon = Resident::start(&p);
+    let base = format!("http://{address}/v1");
+    p.save(direct("native"));
+    p.save(form("chat", "chat_completions", &base, "test-model"));
+    p.save(form("anthropic", "anthropic", &base, "test-model"));
+    let mut token = String::new();
     for (id, path) in [
         ("chat", "/v1/chat/completions"),
         ("anthropic", "/v1/messages"),
     ] {
-        p.switch(id);
-        let status = p.ok("status", json!({}));
-        assert_eq!(status["route"]["running"], true);
-        let port = status["route"]["port"].as_u64().unwrap();
-        assert!(p.live_text().contains(&port.to_string()));
-        let response = runtime.block_on(async {
-            reqwest::Client::new()
-                .post(format!("http://127.0.0.1:{port}/v1/responses"))
-                .header("x-mycodex-route-token", p.route_token())
-                .json(&json!({"model":"test-model","input":"hi","stream":false}))
-                .timeout(std::time::Duration::from_secs(15))
-                .send()
-                .await
-                .unwrap()
-                .json::<Value>()
-                .await
-                .unwrap()
-        });
+        p.apply(id);
+        let route = p.route();
+        assert_eq!(route["mode"], "proxy");
+        assert_eq!(route["takeover"], true);
+        assert_eq!(route["running"], true);
+        assert_eq!(route["accepting"], true);
+        let port = route["port"].as_u64().unwrap();
+        assert!(p.live_text().contains(&format!("127.0.0.1:{port}")));
+        token = p.route_token();
+        let response = route_request(&runtime, port, &token);
         assert_eq!(response["object"], "response", "{response}");
-        let (actual_path, body) = rx.recv_timeout(std::time::Duration::from_secs(2)).unwrap();
+        let (actual_path, body) = rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
         assert_eq!(actual_path, path);
         assert!(body.get("messages").is_some());
     }
-    // Kill with active takeover, then recover the same original port/backup.
-    let before = p.live_text();
-    let port = p.ok("status", json!({}))["route"]["port"].clone();
+    // A restarted host reattaches the route on a newly bound port.
     drop(daemon);
-    let _restarted = Resident::start(&mut p);
-    assert_eq!(p.ok("status", json!({}))["route"]["port"], port);
-    assert_eq!(p.live_text(), before);
-    p.switch("official");
-    assert_eq!(p.ok("status", json!({}))["route"]["running"], false);
-    assert!(p.live().get("model_providers").is_none());
-    let auth: Value =
-        serde_json::from_slice(&fs::read(p.codex.join("auth.json")).unwrap()).unwrap();
-    assert_eq!(auth["tokens"]["account_id"], "official");
-    p.switch("chat");
-    p.switch("native");
-    assert_eq!(p.ok("status", json!({}))["route"]["takeover"], false);
+    let restarted = Resident::start(&p);
+    let route = p.route();
+    assert_eq!(route["accepting"], true);
+    let port = route["port"].as_u64().unwrap();
+    assert!(p.live_text().contains(&format!("127.0.0.1:{port}")));
+    assert_eq!(p.route_token(), token);
+    let response = route_request(&runtime, port, &token);
+    assert_eq!(response["object"], "response", "{response}");
+    rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+    p.apply("native");
+    let route = p.route();
+    assert_eq!(route["takeover"], false);
+    assert_eq!(route["accepting"], false);
     assert!(p.live_text().contains("native.example.invalid"));
-    p.ok("backend/shutdown", json!({}));
+    assert!(!p.live_text().contains("127.0.0.1"));
+    assert!(!p.live_text().contains(HEADER));
+    restarted.shutdown(&p, json!({"forUpdate":false}));
 }
 
 #[test]
-fn streaming_requests_block_mutation_and_old_connections_cannot_route_direct_accounts() {
+fn streaming_requests_block_mutation_and_old_connections_cannot_route_direct() {
     streaming_switch(false);
 }
 
@@ -422,13 +507,17 @@ fn streaming_switch(external: bool) {
         tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
         address
     });
-    let mut p = Probe::new();
-    let _daemon = Resident::start(&mut p);
-    let provider = routed("chat", "openai_chat", &format!("http://{address}/v1"));
-    p.add(provider.clone());
-    p.add(account("official"));
-    let status = p.ok("status", json!({}));
-    let port = status["route"]["port"].as_u64().unwrap();
+    let p = Probe::new();
+    let _daemon = Resident::start(&p);
+    let chat = form(
+        "chat",
+        "chat_completions",
+        &format!("http://{address}/v1"),
+        "test-model",
+    );
+    p.save(chat.clone());
+    p.save(direct("native"));
+    let port = p.route()["port"].as_u64().unwrap();
     let url = format!("http://127.0.0.1:{port}/v1/responses");
     let client = reqwest::Client::new();
     let request_client = client.clone();
@@ -438,7 +527,7 @@ fn streaming_switch(external: bool) {
     let request = runtime.spawn(async move {
         request_client
             .post(request_url)
-            .header("x-mycodex-route-token", request_token)
+            .header(HEADER, request_token)
             .json(&json!({"model":"test-model","input":"hi","stream":true}))
             .timeout(std::time::Duration::from_secs(20))
             .send()
@@ -452,16 +541,25 @@ fn streaming_switch(external: bool) {
         .recv_timeout(std::time::Duration::from_secs(10))
         .unwrap();
     let before = p.live_text();
+    let selected = p.ok("gui/provider/get", json!({"providerId":"native"}));
+    let mut edit = chat.clone();
+    edit["expectedVersion"] =
+        p.ok("gui/provider/get", json!({"providerId":"chat"}))["version"].clone();
     for (method, params) in [
-        ("provider/switch", json!({"providerId":"official"})),
-        ("provider/update", json!({"provider":provider})),
+        (
+            "gui/provider/apply",
+            json!({"providerId":"native","expectedVersion":selected["version"],
+            "expectedFingerprint":"unused","operationId":"blocked-apply"}),
+        ),
+        ("gui/provider/save", edit),
         ("backend/shutdown", json!({})),
         ("backend/shutdown", json!({"forUpdate":true})),
         ("backend/shutdown", json!({"forUpdate":false})),
     ] {
         assert_eq!(
             p.call(method, params)["error"]["message"],
-            "route_requests_active"
+            "route_requests_active",
+            "{method}"
         );
         assert_eq!(p.live_text(), before);
     }
@@ -478,7 +576,7 @@ fn streaming_switch(external: bool) {
             .block_on(
                 client
                     .post(&url)
-                    .header("x-mycodex-route-token", &route_token)
+                    .header(HEADER, &route_token)
                     .json(&json!({"input":"must not forward"}))
                     .send(),
             )
@@ -495,19 +593,20 @@ fn streaming_switch(external: bool) {
         let state = p.ok("gui/provider/list", json!({}));
         assert_eq!(state["liveState"], "current");
         assert_eq!(state["providers"].as_array().unwrap().len(), 3);
+        assert_eq!(state["route"]["takeover"], false);
         assert_eq!(p.live_text(), external_config);
         assert_eq!(
             fs::read_to_string(p.codex.join("auth.json")).unwrap(),
             external_auth
         );
     } else {
-        p.switch("official");
+        p.apply("native");
     }
     // Reuse the HTTP pool: upstream stop alone leaves detached keep-alive tasks.
     let old = runtime.block_on(async {
         client
             .post(url)
-            .header("x-mycodex-route-token", route_token)
+            .header(HEADER, route_token)
             .json(&json!({"model":"test-model","input":"must not forward","stream":false}))
             .timeout(std::time::Duration::from_secs(3))
             .send()
@@ -517,90 +616,79 @@ fn streaming_switch(external: bool) {
         assert_eq!(old.status(), reqwest::StatusCode::SERVICE_UNAVAILABLE);
     }
     assert!(arrived_rx.try_recv().is_err());
-    assert_eq!(p.ok("status", json!({}))["route"]["accepting"], false);
+    assert_eq!(p.route()["accepting"], false);
     p.ok("backend/shutdown", json!({}));
 }
 
 #[test]
-fn resident_rejects_official_conversion_duplicate_add_and_external_live_overwrite() {
-    let mut p = Probe::new();
-    let _daemon = Resident::start(&mut p);
-    p.add(routed("chat", "openai_chat", "https://example.invalid/v1"));
-    p.add(account("official"));
+fn official_conversion_reserved_header_and_external_overwrite_are_rejected() {
+    let p = Probe::new();
+    let _daemon = Resident::start(&p);
+    p.save(form(
+        "chat",
+        "chat_completions",
+        "https://example.invalid/v1",
+        "test-model",
+    ));
     let before = p.live_text();
-    assert_eq!(
-        p.call("provider/add", json!({"provider":api("chat", "new", true)}))["error"]["message"],
-        "provider_already_exists"
-    );
-    assert_eq!(p.live_text(), before);
     for upstream in [
         "https://api.openai.com/v1",
         "https://chatgpt.com/backend-api/codex",
     ] {
         assert_eq!(
             p.call(
-                "provider/add",
-                json!({"provider":routed("bad", "openai_chat", upstream)})
+                "gui/provider/save",
+                form("bad", "chat_completions", upstream, "test-model")
             )["error"]["message"],
             "official_requires_native_responses"
         );
     }
-    for key in ["base_url", "baseURL"] {
-        let mut provider = routed(
-            "bad-precedence",
-            "openai_chat",
-            "https://example.invalid/v1",
-        );
-        provider["settingsConfig"][key] = json!("https://api.openai.com/v1");
-        assert_eq!(
-            p.call("provider/add", json!({"provider":provider}))["error"]["message"],
-            "official_requires_native_responses"
-        );
-    }
+    let mut reserved = form(
+        "reserved",
+        "chat_completions",
+        "https://example.invalid/v1",
+        "test-model",
+    );
+    reserved["advanced"] = json!({"requestHeaders":{"X-MyCodex-Route-Token":"synthetic-secret-x"}});
+    assert_eq!(
+        p.call("gui/provider/save", reserved)["error"]["message"],
+        "reserved_route_header"
+    );
+    assert_eq!(p.live_text(), before);
+    p.save(direct("native"));
+    // An external switch after preflight is adopted, never overwritten by the
+    // stale apply that was planned before it.
+    let selected = p.ok("gui/provider/get", json!({"providerId":"native"}));
+    let preflight = p.ok(
+        "gui/provider/preflight",
+        json!({"providerId":"native","expectedVersion":selected["version"]}),
+    );
     let external = "model = \"externally-selected\"\n";
     fs::write(p.codex.join("config.toml"), external).unwrap();
     fs::write(p.codex.join("auth.json"), "{}").unwrap();
     assert_eq!(
-        p.call("provider/switch", json!({"providerId":"official"}))["error"]["message"],
+        p.call(
+            "gui/provider/apply",
+            json!({"providerId":"native","expectedVersion":selected["version"],
+                "expectedFingerprint":preflight["fingerprint"],"operationId":"stale-apply"})
+        )["error"]["message"],
         "config_conflict"
     );
     assert_eq!(p.live_text(), external);
-    assert_eq!(p.ok("provider/list", json!({}))["currentProviderId"], "");
-    assert_eq!(p.ok("status", json!({}))["route"]["accepting"], false);
+    let state = p.ok("gui/provider/list", json!({}));
+    assert_eq!(state["currentProviderId"], "");
+    assert_eq!(state["liveState"], "signed_out");
+    assert_eq!(state["route"]["accepting"], false);
+    assert_eq!(state["route"]["takeover"], false);
     p.ok("backend/shutdown", json!({}));
     assert_eq!(p.live_text(), external);
     assert_eq!(fs::read_to_string(p.codex.join("auth.json")).unwrap(), "{}");
 }
 
 #[test]
-fn resident_loads_native_account_store_and_uses_original_removal() {
-    let mut p = Probe::new();
-    p.ok("status", json!({}));
-    let store = json!({"version":2,"default_account_id":"saved", "accounts":{"saved":{
-        "account_id":"saved","chatgpt_account_id":"workspace","email":"test@example.invalid",
-        "refresh_token":"synthetic-secret-refresh","authenticated_at":1,"token_updated_at_ms":1}}});
-    fs::write(
-        p.data.join("codex_oauth_auth.json"),
-        serde_json::to_vec(&store).unwrap(),
-    )
-    .unwrap();
-    let _daemon = Resident::start(&mut p);
-    let accounts = p.ok("account/list", json!({}));
-    assert_eq!(accounts["accounts"][0]["id"], "saved");
-    assert_eq!(accounts["accounts"][0]["reauthRequired"], true);
-    p.ok("account/default", json!({"accountId":"saved"}));
-    p.ok("account/remove", json!({"accountId":"saved"}));
-    assert_eq!(p.ok("account/list", json!({}))["accounts"], json!([]));
-    let stored: Value =
-        serde_json::from_slice(&fs::read(p.data.join("codex_oauth_auth.json")).unwrap()).unwrap();
-    assert_eq!(stored["accounts"], json!({}));
-    p.ok("backend/shutdown", json!({}));
-}
-
-#[test]
-fn failed_route_bind_can_switch_back_to_direct_without_stale_proxy_flags() {
-    let mut p = Probe::new();
-    p.ok("status", json!({}));
+fn failed_route_bind_can_return_direct_without_stale_mode() {
+    let p = Probe::new();
+    Resident::start(&p).shutdown(&p, json!({}));
     let occupied = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let connection = rusqlite::Connection::open(p.data.join("cc-switch.db")).unwrap();
     connection
@@ -610,275 +698,67 @@ fn failed_route_bind_can_switch_back_to_direct_without_stale_proxy_flags() {
         )
         .unwrap();
     drop(connection);
-    let _daemon = Resident::start(&mut p);
-    p.add(account("official"));
-    p.add(routed("chat", "openai_chat", "https://example.invalid/v1"));
+    let _daemon = Resident::start(&p);
+    p.save(direct("native"));
+    p.save(form(
+        "chat",
+        "chat_completions",
+        "https://example.invalid/v1",
+        "test-model",
+    ));
+    let before = p.live_text();
+    assert_eq!(p.try_apply("chat")["error"]["message"], "operation_unknown");
+    let route = p.route();
+    assert_eq!(route["accepting"], false);
+    assert_eq!(route["takeover"], false);
     assert_eq!(
-        p.call("provider/switch", json!({"providerId":"chat"}))["error"]["message"],
-        "route_start_failed"
+        p.live_text(),
+        before,
+        "a failed start must not publish a route"
     );
-    assert_eq!(p.ok("status", json!({}))["route"]["accepting"], false);
-    // Refresh observes the original service's partial activation outcome
-    // before a new explicit switch (as the GUI preflight does).
     p.ok("gui/provider/list", json!({}));
-    p.switch("official");
-    let connection = rusqlite::Connection::open(p.data.join("cc-switch.db")).unwrap();
-    let flags: i64 = connection
-        .query_row("SELECT SUM(proxy_enabled) FROM proxy_config", [], |r| {
-            r.get(0)
-        })
-        .unwrap();
-    assert_eq!(flags, 0);
-    assert!(p.live().get("model_providers").is_none());
+    p.apply("native");
+    assert!(!p.live_text().contains("127.0.0.1"));
+    assert_eq!(p.route()["mode"], "direct");
     p.ok("backend/shutdown", json!({}));
 }
 
 #[test]
-fn recovery_finishes_a_partially_restored_backup_without_reenabling_route() {
-    let mut p = Probe::new();
-    let daemon = Resident::start(&mut p);
-    p.add(routed("chat", "openai_chat", "https://example.invalid/v1"));
-    drop(daemon);
-    let connection = rusqlite::Connection::open(p.data.join("cc-switch.db")).unwrap();
-    let backup: String = connection
-        .query_row(
-            "SELECT original_config FROM proxy_live_backup WHERE app_type='codex'",
-            [],
-            |r| r.get(0),
-        )
-        .unwrap();
-    let backup: Value = serde_json::from_str(&backup).unwrap();
-    fs::write(
-        p.codex.join("config.toml"),
-        backup["config"].as_str().unwrap(),
-    )
-    .unwrap();
-    fs::write(
-        p.codex.join("auth.json"),
-        serde_json::to_vec(&backup["auth"]).unwrap(),
-    )
-    .unwrap();
-    drop(connection);
-    let _daemon = Resident::start(&mut p);
-    let status = p.ok("status", json!({}));
-    assert_eq!(status["route"]["running"], false);
-    assert_eq!(status["route"]["takeover"], false);
-    assert!(p.live_text().contains("example.invalid"));
-    p.ok("backend/shutdown", json!({}));
-}
-
-#[test]
-fn recovery_clears_orphaned_enabled_flag_without_changing_external_direct_files() {
-    let mut p = Probe::new();
-    p.add(account("official"));
-    let before = p.live_text();
-    let auth = fs::read(p.codex.join("auth.json")).unwrap();
-    let connection = rusqlite::Connection::open(p.data.join("cc-switch.db")).unwrap();
-    connection
-        .execute(
-            "UPDATE proxy_config SET enabled=1,proxy_enabled=1 WHERE app_type='codex'",
-            [],
-        )
-        .unwrap();
-    drop(connection);
-    let _daemon = Resident::start(&mut p);
-    let status = p.ok("status", json!({}));
-    assert_eq!(status["route"]["running"], false);
-    assert_eq!(status["route"]["takeover"], false);
-    assert_eq!(p.live_text(), before);
-    assert_eq!(fs::read(p.codex.join("auth.json")).unwrap(), auth);
-    p.ok("backend/shutdown", json!({}));
-}
-
-#[test]
-fn native_services_persist_update_and_backfill_across_processes() {
+fn external_switch_while_stopped_is_kept_on_restart() {
     let p = Probe::new();
-    p.add(api("a", "model-a", true));
-    assert_eq!(p.ok("provider/list", json!({}))["currentProviderId"], "a");
-    assert_eq!(p.live()["model"].as_str(), Some("model-a"));
-    p.add(api("b", "model-b", true));
-    p.ok(
-        "provider/update",
-        json!({"provider":api("b", "model-b2", true)}),
-    );
-    assert_eq!(p.live()["model"].as_str(), Some("model-a"));
-    p.ok(
-        "provider/update",
-        json!({"provider":api("a", "model-a2", true)}),
-    );
-    assert_eq!(p.live()["model"].as_str(), Some("model-a2"));
-
-    fs::write(
-        p.codex.join("config.toml"),
-        p.live_text().replace("model-a2", "external-model"),
-    )
-    .unwrap();
-    assert_eq!(p.ok("provider/live", json!({}))["model"], "external-model");
-    p.switch("b");
-    assert_eq!(p.live()["model"].as_str(), Some("model-b2"));
-    let providers = p.ok("provider/list", json!({}));
-    let a = providers["providers"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|v| v["id"] == "a")
-        .unwrap();
-    assert_eq!(a["model"], "external-model");
-    p.switch("a");
-    assert_eq!(p.live()["model"].as_str(), Some("external-model"));
-    assert!(p.data.join("settings.json").exists());
-    assert!(p.data.join("cc-switch.db").exists());
-}
-
-#[test]
-fn common_preferences_tools_and_mcp_keep_upstream_semantics() {
-    let p = Probe::new();
-    p.add(api("a", "model-a", true));
-    p.add(api("b", "model-b", true));
-    p.add(api("c", "model-c", false));
-    let skill = p.codex.join("skills/example/SKILL.md");
-    fs::create_dir_all(skill.parent().unwrap()).unwrap();
-    fs::write(&skill, "synthetic installed skill").unwrap();
-    let plugin = p.codex.join("plugins/example/manifest.json");
-    fs::create_dir_all(plugin.parent().unwrap()).unwrap();
-    fs::write(&plugin, "{}").unwrap();
-    let config = format!("model_reasoning_summary = \"detailed\"\n{}\n[plugins.example]\nenabled = true\n[[skills.config]]\npath = \"example\"\nenabled = false\n[mcp_servers.echo]\ncommand = \"echo\"\nargs = [\"test\"]\n", p.live_text());
-    fs::write(p.codex.join("config.toml"), &config).unwrap();
-    assert_eq!(p.ok("mcp/import", json!({}))["imported"], 1);
-    assert_eq!(p.live_text(), config, "MCP import is read-only for live");
-    p.switch("b");
-    let b = p.live();
-    assert_eq!(b["model_reasoning_summary"].as_str(), Some("detailed"));
-    assert_eq!(b["plugins"]["example"]["enabled"].as_bool(), Some(true));
-    assert_eq!(b["skills"]["config"][0]["enabled"].as_bool(), Some(false));
-    assert_eq!(b["mcp_servers"]["echo"]["command"].as_str(), Some("echo"));
-    p.switch("c");
-    let c = p.live();
-    for key in ["model_reasoning_summary", "plugins", "skills"] {
-        assert!(
-            c.get(key).is_none(),
-            "opt-out must follow upstream for {key}"
-        );
-    }
-    assert_eq!(c["mcp_servers"]["echo"]["command"].as_str(), Some("echo"));
-    p.switch("b");
+    let daemon = Resident::start(&p);
+    p.save(form(
+        "chat",
+        "chat_completions",
+        "https://example.invalid/v1",
+        "test-model",
+    ));
+    assert_eq!(p.route()["takeover"], true);
+    daemon.shutdown(&p, json!({"forUpdate":true}));
+    let external_config = "model='external'\nmodel_provider='external'\n[model_providers.external]\nname='External'\nbase_url='https://external.example.invalid/v1'\nrequires_openai_auth=true\n";
+    let external_auth = r#"{"OPENAI_API_KEY":"synthetic-secret-external"}"#;
+    fs::write(p.codex.join("config.toml"), external_config).unwrap();
+    fs::write(p.codex.join("auth.json"), external_auth).unwrap();
+    let restarted = Resident::start(&p);
+    assert_eq!(p.live_text(), external_config);
     assert_eq!(
-        p.live()["model_reasoning_summary"].as_str(),
-        Some("detailed")
+        fs::read_to_string(p.codex.join("auth.json")).unwrap(),
+        external_auth
     );
-    fs::write(
-        p.codex.join("config.toml"),
-        p.live_text()
-            .replace("model_reasoning_summary = \"detailed\"\n", ""),
-    )
-    .unwrap();
-    p.switch("a");
-    assert!(p.live().get("model_reasoning_summary").is_none());
-    assert_eq!(
-        fs::read_to_string(skill).unwrap(),
-        "synthetic installed skill"
-    );
-    assert_eq!(fs::read_to_string(plugin).unwrap(), "{}");
-}
-
-#[test]
-fn native_chatgpt_auth_switches_direct_and_retains_rotated_live_token() {
-    let mut p = Probe::new();
-    let _daemon = Resident::start(&mut p);
-    p.add(account("account-a"));
-    p.add(account("account-b"));
-    let auth_path = p.codex.join("auth.json");
-    let mut auth: Value = serde_json::from_slice(&fs::read(&auth_path).unwrap()).unwrap();
-    let rotated = account_token("account-a", 2);
-    auth["tokens"]["access_token"] = json!(rotated);
-    auth["tokens"]["refresh_token"] = json!("synthetic-secret-rotated");
-    auth["last_refresh"] = json!("2025-01-01T00:00:00Z");
-    fs::write(&auth_path, serde_json::to_vec(&auth).unwrap()).unwrap();
-    p.switch("account-b");
-    let b: Value = serde_json::from_slice(&fs::read(&auth_path).unwrap()).unwrap();
-    assert_eq!(b["tokens"]["account_id"], "account-b");
-    p.switch("account-a");
-    let a: Value = serde_json::from_slice(&fs::read(&auth_path).unwrap()).unwrap();
-    assert_eq!(a["tokens"]["access_token"], rotated);
-    let live = p.live_text();
-    for marker in ["127.0.0.1", "localhost", "PROXY_MANAGED"] {
-        assert!(!live.contains(marker));
-    }
-    assert!(p.live().get("model_providers").is_none());
-}
-
-#[test]
-fn unsupported_conversion_and_takeover_are_rejected_without_live_writes() {
-    let p = Probe::new();
-    p.add(api("a", "model-a", true));
-    let before = p.live_text();
-    for method in ["provider/add", "provider/update"] {
-        let mut managed = account(if method == "provider/add" { "new" } else { "a" });
-        managed["meta"]["authBinding"] =
-            json!({"source":"managed_account","authProvider":"codex_oauth","accountId":"missing"});
-        assert_eq!(
-            p.call(method, json!({"provider":managed}))["error"]["message"],
-            "managed_oauth_not_supported_in_probe"
-        );
-    }
-    assert_eq!(
-        p.ok("provider/list", json!({}))["providers"]
-            .as_array()
-            .unwrap()
-            .len(),
-        1
-    );
-    let mut conversion = api("conversion", "model", true);
-    conversion["meta"]["apiFormat"] = json!("chat_completions");
-    let response = p.call("provider/add", json!({"provider":conversion}));
-    assert_eq!(
-        response["error"]["message"],
-        "conversion_not_supported_in_probe"
-    );
-    assert_eq!(p.live_text(), before);
-    for key in ["apiFormat", "api_format"] {
-        for format in ["anthropic", "openai_chat"] {
-            let mut conversion = api("conversion", "model", true);
-            conversion["settingsConfig"][key] = json!(format);
-            assert_eq!(
-                p.call("provider/add", json!({"provider":conversion}))["error"]["message"],
-                "conversion_not_supported_in_probe"
-            );
-        }
-    }
-    let mut takeover = api("takeover", "model", true);
-    takeover["settingsConfig"]["auth"]["OPENAI_API_KEY"] = json!("PROXY_MANAGED");
-    assert_eq!(
-        p.call("provider/add", json!({"provider":takeover}))["error"]["message"],
-        "route_takeover_not_supported_in_probe"
-    );
-    assert_eq!(p.live_text(), before);
-    fs::write(
-        p.codex.join("auth.json"),
-        r#"{"OPENAI_API_KEY":"PROXY_MANAGED"}"#,
-    )
-    .unwrap();
-    let response = p.call(
-        "provider/update",
-        json!({"provider":api("a", "replacement", true)}),
-    );
-    assert_eq!(
-        response["error"]["message"],
-        "route_takeover_not_supported_in_probe"
-    );
-    assert_eq!(p.live_text(), before);
-    fs::write(p.codex.join("config.toml"), "[invalid").unwrap();
-    assert!(p
-        .call("provider/switch", json!({"providerId":"a"}))
-        .get("error")
-        .is_some());
-    assert_eq!(p.live_text(), "[invalid");
+    let route = p.route();
+    assert_eq!(route["takeover"], false);
+    assert_eq!(route["running"], false);
+    let state = p.ok("gui/provider/list", json!({}));
+    assert_eq!(state["liveState"], "current");
+    assert_eq!(state["providers"].as_array().unwrap().len(), 2);
+    restarted.shutdown(&p, json!({"forUpdate":false}));
+    assert_eq!(p.live_text(), external_config);
 }
 
 #[test]
 fn existing_store_cannot_redirect_upstream_writes_outside_its_directory() {
     let p = Probe::new();
-    p.ok("status", json!({}));
+    Resident::start(&p).shutdown(&p, json!({}));
     let outside = p.root.path().join("outside");
     fs::create_dir(&outside).unwrap();
     let sentinel = outside.join("sentinel");
@@ -897,16 +777,13 @@ fn existing_store_cannot_redirect_upstream_writes_outside_its_directory() {
     }
     #[cfg(unix)]
     std::os::unix::fs::symlink(&outside, &link).unwrap();
-    let output = p.raw(br#"{"jsonrpc":"2.0","id":1,"method":"status"}"#, &p.codex);
+    let error = p.serve_failure(&p.data, &p.codex);
     // Remove only the link itself, never recursively remove its target.
     #[cfg(windows)]
     fs::remove_dir(link).unwrap();
     #[cfg(unix)]
     fs::remove_file(link).unwrap();
-    assert_eq!(
-        String::from_utf8_lossy(&output.stderr).trim(),
-        "data_dir_contains_link"
-    );
+    assert_eq!(error, "data_dir_contains_link");
     assert_eq!(fs::read_to_string(sentinel).unwrap(), "must stay unchanged");
     assert_eq!(fs::read_dir(outside).unwrap().count(), 1);
 }
@@ -914,29 +791,16 @@ fn existing_store_cannot_redirect_upstream_writes_outside_its_directory() {
 #[test]
 fn store_ownership_target_binding_and_request_validation_fail_closed() {
     let p = Probe::new();
-    let status = br#"{"jsonrpc":"2.0","id":1,"method":"status"}"#;
     fs::write(p.data.join("existing.txt"), "unrelated data").unwrap();
-    let output = p.raw(status, &p.codex);
-    assert!(!output.status.success());
-    assert_eq!(
-        String::from_utf8_lossy(&output.stderr).trim(),
-        "data_dir_not_owned"
-    );
+    assert_eq!(p.serve_failure(&p.data, &p.codex), "data_dir_not_owned");
     fs::remove_file(p.data.join("existing.txt")).unwrap();
-    assert!(p.raw(status, &p.codex).status.success());
+    Resident::start(&p).shutdown(&p, json!({}));
     let second = p.root.path().join("second-codex");
     fs::create_dir(&second).unwrap();
-    let output = p.raw(status, &second);
-    assert_eq!(
-        String::from_utf8_lossy(&output.stderr).trim(),
-        "target_mismatch"
-    );
-    assert_eq!(fs::read_dir(second).unwrap().count(), 0);
-    let output = p.raw(status, &p.data);
-    assert_eq!(
-        String::from_utf8_lossy(&output.stderr).trim(),
-        "overlapping_directories"
-    );
+    assert_eq!(p.serve_failure(&p.data, &second), "target_mismatch");
+    assert_eq!(fs::read_dir(&second).unwrap().count(), 0);
+    assert_eq!(p.serve_failure(&p.data, &p.data), "overlapping_directories");
+    let daemon = Resident::start(&p);
     assert!(!p
         .raw(b"not json synthetic-secret", &p.codex)
         .status
@@ -945,33 +809,38 @@ fn store_ownership_target_binding_and_request_validation_fail_closed() {
         p.call("unknown", json!({}))["error"]["message"],
         "method_not_supported"
     );
+    daemon.shutdown(&p, json!({}));
     fs::write(p.data.join("codex_oauth_auth.json"), "invalid").unwrap();
-    let output = p.raw(status, &p.codex);
-    assert_eq!(
-        String::from_utf8_lossy(&output.stderr).trim(),
-        "managed_oauth_not_supported_in_probe"
-    );
+    assert_eq!(p.serve_failure(&p.data, &p.codex), "account_store_invalid");
 }
 
 #[test]
 fn route_credentials_are_target_private_persistent_and_never_backfilled() {
-    const HEADER: &str = "x-mycodex-route-token";
     let runtime = tokio::runtime::Runtime::new().unwrap();
-    let mut first = Probe::new();
-    let daemon = Resident::start(&mut first);
-    first.add(routed("chat", "openai_chat", "https://example.invalid/v1"));
-    first.add(api("native", "native-model", true));
+    let first = Probe::new();
+    let daemon = Resident::start(&first);
+    first.save(direct("native"));
+    first.save(form(
+        "chat",
+        "chat_completions",
+        "https://example.invalid/v1",
+        "test-model",
+    ));
+    first.apply("chat");
     let token = first.route_token();
     assert_eq!(token.len(), 64);
     assert!(first.live_text().contains("PROXY_MANAGED"));
-    let mut other = Probe::new();
-    let _other_daemon = Resident::start(&mut other);
-    other.add(routed("other", "anthropic", "https://example.invalid/v1"));
+    let other = Probe::new();
+    let other_daemon = Resident::start(&other);
+    other.save(form(
+        "other",
+        "anthropic",
+        "https://example.invalid/v1",
+        "test-model",
+    ));
     let other_token = other.route_token();
     assert!(token != other_token);
-    let port = first.ok("status", json!({}))["route"]["port"]
-        .as_u64()
-        .unwrap();
+    let port = first.route()["port"].as_u64().unwrap();
     let client = reqwest::Client::new();
     for credential in [None, Some("wrong-token"), Some(other_token.as_str())] {
         for path in ["/health", "/v1/responses"] {
@@ -1006,11 +875,10 @@ fn route_credentials_are_target_private_persistent_and_never_backfilled() {
             .unwrap()
     });
     assert_eq!(response.status(), reqwest::StatusCode::UNAUTHORIZED);
-    // Neither the private RPC summaries nor upstream provider/backup snapshots
-    // contain the host capability. The actual upstream API key stays intact.
+    // Neither private RPC summaries nor provider rows contain the host capability.
     assert!(!first.ok("status", json!({})).to_string().contains(&token));
     assert!(!first
-        .ok("provider/list", json!({}))
+        .ok("gui/provider/list", json!({}))
         .to_string()
         .contains(&token));
     let connection = rusqlite::Connection::open(first.data.join("cc-switch.db")).unwrap();
@@ -1021,108 +889,69 @@ fn route_credentials_are_target_private_persistent_and_never_backfilled() {
             |row| row.get(0),
         )
         .unwrap();
-    let backup: String = connection
-        .query_row(
-            "SELECT original_config FROM proxy_live_backup WHERE app_type='codex'",
-            [],
-            |row| row.get(0),
-        )
-        .unwrap();
-    for value in [&stored, &backup] {
-        assert!(!value.contains(&token) && !value.contains(HEADER));
-    }
+    assert!(!stored.contains(&token) && !stored.contains(HEADER));
     assert!(stored.contains("synthetic-secret-chat"));
     drop(connection);
-    let mut invalid = routed("bad", "openai_chat", "https://example.invalid/v1");
-    invalid["settingsConfig"]["config"] = json!(format!(
-        "{}\n[model_providers.bad.http_headers]\nX-MyCodex-Route-Token = \"{token}\"\n",
-        invalid["settingsConfig"]["config"].as_str().unwrap()
-    ));
-    assert_eq!(
-        first.call("provider/add", json!({"provider":invalid}))["error"]["message"],
-        "reserved_route_header"
-    );
     drop(daemon);
-    let _restarted = Resident::start(&mut first);
+    let restarted = Resident::start(&first);
     assert!(first.route_token() == token);
-    first.switch("native");
+    first.apply("native");
     assert!(!first.live_text().contains(HEADER) && !first.live_text().contains(&token));
-    first.switch("chat");
+    first.apply("chat");
     assert!(first.route_token() == token);
-    first.ok("backend/shutdown", json!({}));
+    first.apply("native");
+    restarted.shutdown(&first, json!({}));
     assert!(!first.live_text().contains(HEADER) && !first.live_text().contains(&token));
-    other.ok("backend/shutdown", json!({}));
+    other_daemon.shutdown(&other, json!({"forUpdate":true}));
 }
 
 #[test]
-fn altered_route_credentials_and_orphaned_route_are_preserved_for_repair() {
-    let mut p = Probe::new();
-    let daemon = Resident::start(&mut p);
-    p.add(routed("chat", "openai_chat", "https://example.invalid/v1"));
+fn altered_route_credentials_are_treated_as_an_external_change() {
+    let p = Probe::new();
+    let daemon = Resident::start(&p);
+    p.save(form(
+        "chat",
+        "chat_completions",
+        "https://example.invalid/v1",
+        "test-model",
+    ));
     let token = p.route_token();
-    let original = p.live_text();
-    let changed = original.replace(&token, "external-change");
+    let changed = p.live_text().replace(&token, "external-change");
     fs::write(p.codex.join("config.toml"), &changed).unwrap();
     assert_eq!(
         p.ok("gui/provider/list", json!({}))["liveState"],
         "unavailable"
     );
     assert!(p.live_text() == changed);
-    assert_eq!(p.ok("status", json!({}))["route"]["accepting"], false);
-    p.ok("backend/shutdown", json!({}));
+    assert_eq!(p.route()["accepting"], false);
+    daemon.shutdown(&p, json!({"forUpdate":true}));
     assert!(p.live_text() == changed);
-    fs::write(p.codex.join("config.toml"), original).unwrap();
-    drop(daemon);
-    // Without a provider or backup, keep the global files intact for repair.
-    let connection = rusqlite::Connection::open(p.data.join("cc-switch.db")).unwrap();
-    connection
-        .execute("DELETE FROM proxy_live_backup WHERE app_type='codex'", [])
-        .unwrap();
-    connection
-        .execute("DELETE FROM providers WHERE app_type='codex'", [])
-        .unwrap();
-    drop(connection);
-    let _restarted = Resident::start(&mut p);
-    assert!(p.live_text().contains("x-mycodex-route-token") && p.live_text().contains(&token));
-    assert_eq!(
-        p.ok("gui/provider/list", json!({}))["liveState"],
-        "unavailable"
-    );
-    assert_eq!(p.ok("status", json!({}))["route"]["running"], false);
+    // The changed client still targets this host's proxy placeholder: the route
+    // is not reattached, and v4 retires the unusable route key fields instead of
+    // leaving Codex pointed at a proxy that rejects it.
+    let _restarted = Resident::start(&p);
+    assert_eq!(p.route()["takeover"], false);
+    assert_eq!(p.route()["running"], false);
+    let live = p.live();
+    assert!(live.get("model_provider").is_none(), "{live}");
+    assert!(!p.live_text().contains("PROXY_MANAGED"));
+    assert!(!p.live_text().contains(&token));
     p.ok("backend/shutdown", json!({}));
 }
 
 #[test]
-fn offline_probe_cannot_bypass_the_resident_target_lock_with_another_store() {
-    let mut p = Probe::new();
-    let _daemon = Resident::start(&mut p);
-    p.add(api("native", "model-before", false));
-    let before = p.live_text();
-    let other = Probe::new();
-    let input = serde_json::to_vec(&json!({"jsonrpc":"2.0","id":1,"method":"provider/add",
-        "params":{"provider":api("injected", "must-not-write", false)}}))
-    .unwrap();
-    let output = other.raw(&input, &p.codex);
-    assert!(!output.status.success());
-    assert_eq!(
-        String::from_utf8_lossy(&output.stderr).trim(),
-        "backend_already_running"
-    );
-    assert!(p.live_text() == before);
-    assert!(!other.data.join("cc-switch.db").exists());
-    p.ok("backend/shutdown", json!({}));
-}
-
-#[test]
-fn maintenance_update_preserves_takeover_and_uninstall_requires_direct() {
-    let mut p = Probe::new();
-    let mut daemon = Resident::start(&mut p);
-    p.add(routed("conversion", "openai_chat", "http://127.0.0.1:9/v1"));
-    p.add(api("direct", "test-model", true));
-    p.switch("conversion");
-    let before = p.live_text();
+fn maintenance_update_preserves_the_route_and_uninstall_requires_direct() {
+    let p = Probe::new();
+    let daemon = Resident::start(&p);
+    p.save(form(
+        "conversion",
+        "chat_completions",
+        "http://127.0.0.1:9/v1",
+        "test-model",
+    ));
+    p.save(direct("direct"));
+    let token = p.route_token();
     let auth = fs::read(p.codex.join("auth.json")).ok();
-    let port = p.ok("status", json!({}))["route"]["port"].clone();
     assert_eq!(
         p.call("backend/shutdown", json!({"forUpdate":"true"}))["error"]["message"],
         "invalid_params"
@@ -1131,20 +960,134 @@ fn maintenance_update_preserves_takeover_and_uninstall_requires_direct() {
         p.call("backend/shutdown", json!({"forUpdate":false}))["error"]["message"],
         "route_required"
     );
-    assert_eq!(p.ok("status", json!({}))["route"]["running"], true);
-    p.ok("backend/shutdown", json!({"forUpdate":true}));
-    assert!(daemon.0.wait().unwrap().success());
+    assert_eq!(p.route()["running"], true);
+    let before = p.live_text();
+    daemon.shutdown(&p, json!({"forUpdate":true}));
     assert_eq!(p.live_text(), before);
     assert_eq!(fs::read(p.codex.join("auth.json")).ok(), auth);
-    let mut replacement = Resident::start(&mut p);
-    let route = p.ok("status", json!({}))["route"].clone();
-    assert_eq!(route["port"], port);
+    let replacement = Resident::start(&p);
+    let route = p.route();
     assert_eq!(route["accepting"], true);
-    assert_eq!(p.live_text(), before);
-    p.switch("direct");
+    assert_eq!(route["takeover"], true);
+    assert_eq!(p.route_token(), token);
+    let port = route["port"].as_u64().unwrap();
+    assert!(p.live_text().contains(&format!("127.0.0.1:{port}")));
+    p.apply("direct");
     let direct = p.live_text();
-    p.ok("backend/shutdown", json!({"forUpdate":false}));
-    assert!(replacement.0.wait().unwrap().success());
+    replacement.shutdown(&p, json!({"forUpdate":false}));
     assert_eq!(p.live_text(), direct);
     assert!(p.data.join("cc-switch.db").exists());
+}
+
+#[test]
+fn v3_store_migrates_and_direct_switch_preserves_user_settings() {
+    let Some(v3) = v3_host() else {
+        return;
+    };
+    let p = Probe::new();
+    let old = Resident::start_with(&p, &v3, 2);
+    for id in ["alpha", "beta"] {
+        p.call_with(&v3, "gui/provider/save", direct(id));
+    }
+    old.shutdown_with(&p, &v3);
+    let v3_live = p.live_text();
+    assert!(v3_live.contains("alpha.example.invalid"), "{v3_live}");
+    // Content a user or another tool adds after the switch.
+    let user = "approval_policy = \"on-request\"\n# kept by the user\n";
+    let mcp = "\n[mcp_servers.user_tool]\ncommand = \"user-tool\"\nargs = [\"--flag\"]\n";
+    fs::write(p.codex.join("config.toml"), format!("{user}{v3_live}{mcp}")).unwrap();
+
+    let resident = Resident::start(&p);
+    let list = p.ok("gui/provider/list", json!({}));
+    assert_eq!(list["providers"].as_array().unwrap().len(), 2, "{list}");
+    assert_eq!(list["currentProviderId"], "alpha");
+    p.apply("beta");
+    let live = p.live_text();
+    let parsed: toml::Value = toml::from_str(&live).unwrap();
+    // v4 writes every third-party route as the fixed `custom` table.
+    assert_eq!(parsed["model_provider"].as_str(), Some("custom"), "{live}");
+    assert_eq!(parsed["model"].as_str(), Some("beta-model"), "{live}");
+    assert_eq!(
+        parsed["model_providers"]["custom"]["base_url"].as_str(),
+        Some("https://beta.example.invalid/v1")
+    );
+    assert!(
+        live.contains(user),
+        "user lines must survive byte for byte:\n{live}"
+    );
+    assert!(
+        live.contains(mcp.trim()),
+        "user MCP table must survive:\n{live}"
+    );
+    assert_eq!(
+        p.ok("gui/provider/list", json!({}))["currentProviderId"],
+        "beta"
+    );
+    resident.shutdown(&p, json!({"forUpdate":true}));
+}
+
+#[test]
+fn v3_route_migrates_and_keeps_routing_on_v4() {
+    let Some(v3) = v3_host() else {
+        return;
+    };
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let (address, rx) = upstream(&runtime);
+    let p = Probe::new();
+    let old = Resident::start_with(&p, &v3, 2);
+    p.call_with(
+        &v3,
+        "gui/provider/save",
+        form(
+            "chat",
+            "chat_completions",
+            &format!("http://{address}/v1"),
+            "test-model",
+        ),
+    );
+    let v3_live = p.live_text();
+    assert!(v3_live.contains(HEADER), "{v3_live}");
+    old.shutdown_with(&p, &v3);
+    let connection = rusqlite::Connection::open(p.data.join("cc-switch.db")).unwrap();
+    let backups: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM proxy_live_backup WHERE app_type='codex'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(backups, 1, "v3 keeps a takeover backup");
+    drop(connection);
+
+    let resident = Resident::start(&p);
+    let route = p.route();
+    assert_eq!(route["takeover"], true, "{route}");
+    assert_eq!(route["accepting"], true);
+    let port = route["port"].as_u64().unwrap();
+    let token = p.route_token();
+    let response = route_request(&runtime, port, &token);
+    assert_eq!(response["object"], "response", "{response}");
+    let (path, _) = rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+    assert_eq!(path, "/v1/chat/completions");
+    let connection = rusqlite::Connection::open(p.data.join("cc-switch.db")).unwrap();
+    let backups: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM proxy_live_backup WHERE app_type='codex'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(backups, 0, "the legacy backup moves into the store");
+    drop(connection);
+    let drained = p.data.join("backups").join("proxy-live-backup");
+    assert_eq!(fs::read_dir(drained).unwrap().count(), 1);
+    resident.shutdown(&p, json!({"forUpdate":true}));
+}
+
+impl Resident {
+    fn shutdown_with(mut self, p: &Probe, executable: &Path) {
+        let response = p.call_with(executable, "backend/shutdown", json!({"forUpdate":true}));
+        assert_eq!(response["result"]["status"], "shutting_down", "{response}");
+        assert!(self.0.wait().unwrap().success());
+    }
 }

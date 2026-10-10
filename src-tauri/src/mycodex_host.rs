@@ -1,11 +1,6 @@
 //! Minimal Codex-only stdio adapter over the original service layer.
 //! No desktop bootstrap or parallel provider persistence engine.
-//!
-//! Phase 1 of docs/mycodex-auth-v4-port.md: this host runs on the v4 kernel
-//! with a reduced protocol. The v3 adapter modules (`accounts`, `auto_capture`,
-//! `gui*`, `runtime_config`) stay in the tree but are not compiled until phase 2
-//! rebuilds them on the v4 key-field and mode services.
-use crate::{AppState, AppType, Database, Provider, ProviderService};
+use crate::{AppState, Database};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::ffi::OsString;
@@ -14,10 +9,19 @@ use std::io::Write;
 use std::path::PathBuf;
 use std::sync::{Arc, OnceLock};
 
+mod accounts;
+pub(crate) mod auto_capture;
+mod gui;
+mod gui_accounts;
+mod gui_catalog;
+mod gui_config;
+mod gui_mcp;
+mod gui_provider;
 mod identity;
 mod ipc;
 pub(crate) mod lifecycle;
 mod paths;
+mod runtime_config;
 mod security;
 
 type Result<T> = std::result::Result<T, &'static str>;
@@ -47,6 +51,7 @@ struct Request {
 
 pub(super) struct Host {
     state: AppState,
+    gui: std::sync::Mutex<gui::Session>,
 }
 
 pub fn run(mut args: impl Iterator<Item = OsString>) -> Result<()> {
@@ -137,7 +142,10 @@ fn initialize_state() -> Result<Arc<Host>> {
         _ => (),
     }
     lifecycle::configure(&state)?;
-    Ok(Arc::new(Host { state }))
+    Ok(Arc::new(Host {
+        state,
+        gui: Default::default(),
+    }))
 }
 
 fn parse_request(bytes: &[u8]) -> Result<Request> {
@@ -177,61 +185,60 @@ fn output(response: &Value) -> Result<()> {
 fn handle(host: &Host, request: &Request) -> Result<Value> {
     let state = &host.state;
     let p = &request.params;
+    if matches!(
+        request.method.as_str(),
+        "gui/provider/save"
+            | "gui/provider/copy"
+            | "gui/provider/delete"
+            | "gui/provider/apply"
+            | "gui/provider/preflight"
+            | "gui/account/delete"
+            | "backend/shutdown"
+            | "gui/mcp/import"
+            | "gui/mcp/save"
+            | "gui/mcp/delete"
+    ) {
+        lifecycle::pause_if_external();
+    }
     match request.method.as_str() {
         "status" => {
             let mut value = identity::target_identity()?;
             value["stage"] = json!("upstream-core-resident");
-            value["capabilities"] = json!(Vec::<&str>::new());
+            value["capabilities"] = json!([
+                "codexNativeServices",
+                "codexManagedAccounts",
+                "codexConversionLifecycle",
+                "contextSettings",
+                "configEditing",
+                "guiProviderManagement",
+                "guiMcpManagement",
+                "globalAuthCapture",
+                "runtimeConfigPreparation",
+            ]);
             value["route"] = lifecycle::status(state)?;
             Ok(value)
         }
-        // Read-only list for phase 1; phase 2 restores capture and editing.
-        "gui/provider/list" => {
-            let providers = ProviderService::list(state, AppType::Codex).map_err(service_error)?;
-            let current = ProviderService::current(state, AppType::Codex).map_err(service_error)?;
-            Ok(json!({"currentProviderId":current,
-                "providers":providers.values().map(summary).collect::<Result<Vec<_>>>()?}))
-        }
-        // Temporary phase 1 direct switch; phase 2 replaces it with gui/provider/apply.
-        "provider/switch" => {
-            let id = p["providerId"].as_str().ok_or("invalid_params")?;
-            let _guard = lifecycle::mutation()?;
-            state
-                .db
-                .get_provider_by_id(id, "codex")
-                .map_err(service_error)?
-                .ok_or("provider_not_found")?;
-            let switched =
-                ProviderService::switch(state, AppType::Codex, id).map_err(service_error)?;
-            // Warnings may contain upstream-controlled text; expose only their count.
-            Ok(json!({"providerId":id,"warningCount":switched.warnings.len()}))
-        }
+        "runtime/prepare" => runtime_config::prepare(),
         "backend/shutdown" => {
-            p.get("forUpdate")
+            let for_update = p
+                .get("forUpdate")
                 .map(|v| v.as_bool().ok_or("invalid_params"))
                 .transpose()?;
             let _guard = lifecycle::mutation()?;
+            if gui_accounts::login_pending(host)? {
+                return Err("login_in_progress");
+            }
+            // Keep the route and its mode for a replacement process; a plain stop
+            // while Codex is routed here would leave Codex without its endpoint.
+            if for_update == Some(false) && lifecycle::status(state)?["attached"] == true {
+                return Err("route_required");
+            }
             lifecycle::stop_listener(state)?;
             Ok(json!({"status":"shutting_down"}))
         }
+        method if method.starts_with("gui/") => gui::handle(host, method, p),
         _ => Err("method_not_supported"),
     }
-}
-
-fn configuration_summary(settings: &Value) -> Result<Value> {
-    let config: toml::Value =
-        toml::from_str(settings["config"].as_str().unwrap_or("")).map_err(|_| "invalid_config")?;
-    Ok(
-        json!({"model":config.get("model").and_then(toml::Value::as_str).unwrap_or(""),
-        "modelProvider":config.get("model_provider").and_then(toml::Value::as_str).unwrap_or("openai")}),
-    )
-}
-
-fn summary(provider: &Provider) -> Result<Value> {
-    let mut result = configuration_summary(&provider.settings_config)?;
-    result["id"] = json!(provider.id);
-    result["name"] = json!(provider.name);
-    Ok(result)
 }
 
 fn service_error(error: crate::AppError) -> &'static str {

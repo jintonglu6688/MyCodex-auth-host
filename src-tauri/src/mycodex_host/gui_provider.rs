@@ -1,6 +1,6 @@
 //! Flat form fields mapped onto native Provider data; no provider persistence here.
 use super::{gui_catalog, service_error, Result};
-use crate::{AppState, AppType, Provider, ProviderService};
+use crate::{AppState, AppType, Provider};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
@@ -33,30 +33,39 @@ pub(super) fn stored(state: &AppState, id: &str) -> Result<Provider> {
         .ok_or("provider_not_found")
 }
 
+// v4 rows own the key fields and global settings stay in the live file. While a
+// provider is in direct use, Codex and MyCodex may change its model and
+// reasoning settings in the live file; the form shows and saves those values
+// without persisting them on read.
 pub(super) fn snapshot(state: &AppState, provider: &Provider) -> Result<Provider> {
     let mut edited = provider.clone();
-    if ProviderService::current(state, AppType::Codex).map_err(service_error)? == provider.id
-        && !state
-            .proxy_service
-            .detect_takeover_in_live_config_for_app(&AppType::Codex)
-    {
-        let Some(live) = super::auto_capture::owned_snapshot(state, provider).unwrap_or(None)
-        else {
-            return Ok(edited);
-        };
-        let live = crate::services::provider::strip_common_config_from_live_settings(
-            &state.db,
-            &AppType::Codex,
-            provider,
-            live,
-        );
-        // Keep native fields not represented by auth/config (catalog and future metadata).
-        for field in ["auth", "config"] {
-            if let Some(value) = live.get(field) {
-                edited.settings_config[field] = value.clone();
+    let Some(live) = super::auto_capture::live_overlay(state, provider).unwrap_or(None) else {
+        return Ok(edited);
+    };
+    let Ok(live) = live.parse::<toml_edit::DocumentMut>() else {
+        return Ok(edited);
+    };
+    let mut row = edited.settings_config["config"]
+        .as_str()
+        .unwrap_or("")
+        .parse::<toml_edit::DocumentMut>()
+        .map_err(|_| "invalid_config")?;
+    for key in [
+        "model",
+        "model_reasoning_effort",
+        "plan_mode_reasoning_effort",
+        "review_model",
+    ] {
+        match live.get(key).and_then(toml_edit::Item::as_value) {
+            Some(value) => row[key] = toml_edit::Item::Value(value.clone()),
+            // A missing model keeps the saved one; other fields follow the live file.
+            None if key != "model" => {
+                row.remove(key);
             }
+            None => (),
         }
     }
+    edited.settings_config["config"] = json!(row.to_string());
     Ok(edited)
 }
 
@@ -70,8 +79,15 @@ pub(super) fn clear_chatgpt_catalog(provider: &mut Provider) -> Result<bool> {
         return Ok(false);
     }
     let config = provider.settings_config["config"].as_str().unwrap_or("");
-    let cleaned = crate::codex_config::set_codex_model_catalog_json_field(config, None)
-        .map_err(|_| "invalid_config")?;
+    let cleaned = if crate::live::project::codex::live_catalog_is_ours(config) {
+        let mut doc = config
+            .parse::<toml_edit::DocumentMut>()
+            .map_err(|_| "invalid_config")?;
+        doc.remove(crate::live::project::codex::MODEL_CATALOG_JSON);
+        doc.to_string()
+    } else {
+        config.to_string()
+    };
     let changed = cleaned != config || provider.settings_config.get("modelCatalog").is_some();
     if changed {
         provider
@@ -163,7 +179,6 @@ pub(super) fn summary(state: &AppState, stored: &Provider, edited: &Provider) ->
         "hasApiKey":!key.is_empty(),"accountId":account_id,
         "accountLabel":account.map(|a| a.login.as_str()),
         "needsReauthentication":account_id.is_some() && account.is_none_or(|a|a.reauth_required),
-        "commonConfigEnabled":edited.meta.as_ref().and_then(|m|m.common_config_enabled).unwrap_or(true),
         "models":masked(&json!(gui_catalog::read_models(edited)?)),"advanced":masked(&read_advanced(edited)?)}))
 }
 
@@ -447,11 +462,6 @@ pub(super) fn edit_draft(mut provider: Provider, params: &Value, draft: bool) ->
     }
     let meta = provider.meta.get_or_insert_with(Default::default);
     meta.api_format = Some(format.to_string());
-    if let Some(enabled) = params.get("commonConfigEnabled") {
-        meta.common_config_enabled = Some(enabled.as_bool().ok_or("invalid_params")?);
-    } else if meta.common_config_enabled.is_none() {
-        meta.common_config_enabled = Some(true);
-    }
     if kind == "chatgpt" {
         let id = params["accountId"]
             .as_str()

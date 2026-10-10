@@ -50,7 +50,7 @@ with tempfile.TemporaryDirectory(prefix="mycodex-core-unix-") as temporary:
         line = server.stdout.readline()
         assert line, server.stderr.read().decode()
         ready = json.loads(line)
-        assert ready["event"] == "ready" and ready["protocolVersion"] == 2
+        assert ready["event"] == "ready" and ready["protocolVersion"] == 3
         assert ready["codexHome"] == str(codex) and ready["dataDir"] == str(data)
         assert data.stat().st_mode & 0o777 == 0o700
         assert endpoint.stat().st_mode & 0o777 == 0o700
@@ -65,7 +65,7 @@ with tempfile.TemporaryDirectory(prefix="mycodex-core-unix-") as temporary:
 
         status = rpc("status")["result"]
         assert status["sha256"] == ready["sha256"]
-        assert status["protocolVersion"] == 2 and "guiMcpManagement" in status["capabilities"]
+        assert status["protocolVersion"] == 3 and "guiMcpManagement" in status["capabilities"]
         assert run(["serve", *args], ok=False) == "backend_already_running"
         wrong = root / "wrong-store"
         wrong.mkdir()

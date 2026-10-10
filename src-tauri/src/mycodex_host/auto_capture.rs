@@ -1,4 +1,4 @@
-//! Adopt the effective global identity before native snapshots or switching.
+//! Adopt the effective global identity before reading or changing providers.
 //! This module writes only the target's private stores, never Codex live files.
 use super::{gui_provider, lifecycle, service_error, Result};
 use crate::{codex_config as codex, AppState, AppType, McpService, Provider, ProviderService};
@@ -26,7 +26,7 @@ impl Outcome {
 
 // Do not cache credentials or infer ownership from the last successful read.
 pub(super) fn read(state: &AppState) -> Result<Outcome> {
-    lifecycle::pause_if_external(state);
+    lifecycle::pause_if_external();
     let _guard = match lifecycle::mutation() {
         Ok(guard) => guard,
         Err(error) => return Ok(Outcome::unavailable(error)),
@@ -56,6 +56,37 @@ fn reconcile(state: &AppState, source: &'static str) -> Result<Outcome> {
         Err("database_failed" | "account_store_invalid") => Err("account_store_invalid"),
         Err(error) => Ok(Outcome::unavailable(error)),
     }
+}
+
+pub(super) fn live_config_text() -> Result<String> {
+    match std::fs::read(codex::get_codex_config_path()) {
+        Ok(bytes) if bytes.len() <= 4 * 1024 * 1024 => {
+            String::from_utf8(bytes).map_err(|_| "invalid_live_config")
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(String::new()),
+        _ => Err("invalid_live_config"),
+    }
+}
+
+/// The live config text when it belongs to `provider` as the direct provider in
+/// use. Routed clients hold the proxy contract, not the provider's own values.
+pub(super) fn live_overlay(state: &AppState, provider: &Provider) -> Result<Option<String>> {
+    if ProviderService::current(state, AppType::Codex).map_err(service_error)? != provider.id {
+        return Ok(None);
+    }
+    let snapshot = Snapshot::read()?;
+    let text = snapshot.live["config"].as_str().unwrap_or("").to_string();
+    if lifecycle::owns_live(&text) {
+        return Ok(None);
+    }
+    let Some(identity) = identity::identify(&snapshot.live)? else {
+        return Ok(None);
+    };
+    if !identity::matches(state, provider, &identity)? {
+        return Ok(None);
+    }
+    snapshot.unchanged()?;
+    Ok(Some(text))
 }
 
 struct Snapshot {
@@ -101,16 +132,22 @@ impl Snapshot {
 }
 
 fn set_current(state: &AppState, id: &str) -> Result<()> {
+    // Both the provider in use and the direct pointer already name `id`.
     if ProviderService::current(state, AppType::Codex).map_err(service_error)? == id
-        && state
-            .db
-            .get_current_provider("codex")
-            .map_err(service_error)?
-            .unwrap_or_default()
+        && crate::mode::current::provider_for(
+            &state.db,
+            &AppType::Codex,
+            crate::mode::current::Purpose::Direct,
+        )
+        .map_err(service_error)?
+        .unwrap_or_default()
             == id
     {
         return Ok(());
     }
+    // Serialize with v4 switches; the pointer changes without writing client files.
+    let _guard = crate::mode::controller::lock_settled_blocking(state, &AppType::Codex)
+        .map_err(service_error)?;
     state
         .db
         .set_current_provider("codex", id)
@@ -127,7 +164,7 @@ fn capture(state: &AppState, trace: &mut diagnostics::Trace) -> Result<Outcome> 
     let previous = ProviderService::current(state, AppType::Codex).map_err(service_error)?;
     trace.previous_ref = diagnostics::reference(&previous);
     trace.stage = "check_route_owner";
-    if lifecycle::owns_snapshot(state, &snapshot.live)? {
+    if lifecycle::owns_live(snapshot.live["config"].as_str().unwrap_or("")) {
         let provider = gui_provider::stored(state, &previous)?;
         if !lifecycle::conversion(&provider)? {
             return Err("route_live_changed_externally");
@@ -135,7 +172,7 @@ fn capture(state: &AppState, trace: &mut diagnostics::Trace) -> Result<Outcome> 
         trace.kind = "routed";
         trace.branch = "owned_route";
         trace.provider_ref = diagnostics::reference(&previous);
-        lifecycle::resume_owned(state)?;
+        lifecycle::sync_routing(state);
         trace.stage = "complete";
         return Ok(Outcome {
             current: previous,
@@ -172,7 +209,7 @@ fn capture(state: &AppState, trace: &mut diagnostics::Trace) -> Result<Outcome> 
     for provider in providers.values() {
         if !lifecycle::conversion(provider)? && identity::matches(state, provider, &detected)? {
             candidates.push(provider.clone());
-            if identity::same_settings(state, provider, &snapshot.live)? {
+            if identity::same_settings(provider, &snapshot.live)? {
                 exact.push(provider.id.clone());
             }
         }
@@ -223,14 +260,16 @@ fn capture(state: &AppState, trace: &mut diagnostics::Trace) -> Result<Outcome> 
     let mut provider = match chosen {
         Some(id) => gui_provider::stored(state, &id)?,
         None => {
+            // v4 rows hold key fields; everything else stays in the live file.
+            let config = identity::projection_text(&snapshot.live, detected.chatgpt)
+                .ok_or("invalid_live_config")?;
             let mut provider = Provider::with_id(
                 uuid::Uuid::new_v4().to_string(),
                 detected.name.clone(),
-                snapshot.live.clone(),
+                json!({"auth":detected.saved_auth,"config":config}),
                 None,
             );
             let meta = provider.meta.get_or_insert_with(Default::default);
-            meta.common_config_enabled = Some(true);
             meta.api_format = Some("openai_responses".into());
             provider
         }
@@ -254,8 +293,6 @@ fn capture(state: &AppState, trace: &mut diagnostics::Trace) -> Result<Outcome> 
         meta.provider_type = Some("codex_oauth".into());
         provider.category = Some("official".into());
         provider.settings_config["auth"] = json!({});
-    } else if created {
-        provider.settings_config["auth"] = detected.saved_auth.clone();
     }
     trace.stage = "initialize_capture";
     // Only initialization imports MCP; ordinary list refresh is not an MCP sync.
@@ -272,29 +309,6 @@ fn capture(state: &AppState, trace: &mut diagnostics::Trace) -> Result<Outcome> 
         state
             .db
             .set_setting("mycodex.captureInitialized", "1")
-            .map_err(service_error)?;
-    }
-    if created {
-        trace.stage = "capture_common";
-        let mut result = crate::services::provider::SwitchResult::default();
-        ProviderService::sync_common_config_snippet_from_live(
-            state,
-            &AppType::Codex,
-            &provider,
-            &snapshot.live,
-            &mut result,
-        );
-        if !result.warnings.is_empty() {
-            return Err("save_outcome_unknown");
-        }
-        provider.settings_config =
-            crate::services::provider::strip_common_config_from_live_settings(
-                &state.db,
-                &AppType::Codex,
-                &provider,
-                provider.settings_config.clone(),
-            );
-        codex::strip_codex_mcp_servers_from_settings(&mut provider.settings_config)
             .map_err(service_error)?;
     }
     snapshot.unchanged()?;
@@ -331,64 +345,4 @@ fn capture(state: &AppState, trace: &mut diagnostics::Trace) -> Result<Outcome> 
         state: "current",
         error: None,
     })
-}
-
-// Called inside the native snapshot path too, so no caller can attach B's live to A.
-pub(super) fn owned_snapshot(state: &AppState, provider: &Provider) -> Result<Option<Value>> {
-    if lifecycle::owns_live(state)? {
-        return Ok(None);
-    }
-    let snapshot = Snapshot::read()?;
-    let Some(identity) = identity::identify(&snapshot.live)? else {
-        return Ok(None);
-    };
-    if !identity::matches(state, provider, &identity)? {
-        return Ok(None);
-    }
-    snapshot.unchanged()?;
-    Ok(Some(snapshot.live))
-}
-
-pub(crate) fn require_live_owner(
-    state: &AppState,
-    provider: &Provider,
-    live: &Value,
-) -> Result<()> {
-    if lifecycle::owns_snapshot(state, live)? {
-        return if ProviderService::current(state, AppType::Codex).map_err(service_error)?
-            == provider.id
-            && lifecycle::conversion(provider)?
-        {
-            Ok(())
-        } else {
-            Err("config_conflict")
-        };
-    }
-    // Native takeover-off restores a provider-built backup verbatim. It may
-    // hold the key in auth before the normal writer projects a bearer token.
-    // Accept only an equivalent real upstream identity, never a proxy marker.
-    if lifecycle::conversion(provider)? {
-        let mut effective = live.clone();
-        effective["config"] = json!(codex::prepare_codex_provider_live_config(
-            &live["auth"],
-            live["config"].as_str().ok_or("invalid_live_config")?
-        )
-        .map_err(service_error)?);
-        let Some(identity) = identity::identify(&effective)? else {
-            return Err("config_conflict");
-        };
-        return if identity::matches(state, provider, &identity)? {
-            Ok(())
-        } else {
-            Err("config_conflict")
-        };
-    }
-    let Some(identity) = identity::identify(live)? else {
-        return Err("config_conflict");
-    };
-    if identity::matches(state, provider, &identity)? {
-        Ok(())
-    } else {
-        Err("config_conflict")
-    }
 }
