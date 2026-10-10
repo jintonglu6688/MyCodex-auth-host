@@ -151,7 +151,12 @@
 - **`runtime/prepare` 仍需要**：v4 把 `disable_response_storage` 列为关键字段（`live/project/codex.rs` 的 `ROW_TOP_FIELDS`），供应商行里有这个键时切换会写回 `config.toml`，而这正是此前用 `normalize_live_config` 清除的遗留设置。第二阶段在宿主投影中排除它，并保留启动前清理（含 MCP 表里的 `type`）。
 - **登录导入**：`extract_codex_managed_oauth_account_id` 在 v4 中是私有函数，且只接受显式的 `auth_mode = "chatgpt"`；已恢复为 `pub(crate)` 并接受旧式隐式 ChatGPT 登录形状。浏览器登录和导入代码暂时没有调用方（账号模块在第一阶段未编译），第二阶段接回。
 - **迁移验证（合成数据）**：用校验过的 0.2.3 发布版（SHA-256 `785c44dc…`）生成 3.x 私有库和 `config.toml`，再加入用户自己的顶层设置、注释和 MCP 表；v4 宿主启动后列表和当前供应商正确，直连切换只替换关键字段，用户内容逐字节保留。见 `src-tauri/tests/mycodex_host_v4.rs`，设置 `MYCODEX_V3_HOST` 指向 0.2.3 程序后运行，否则跳过。
-- **尚未完成**：真实私有库副本的迁移验证（含令牌，需单独确认后在临时目录进行）；托管账号、通用配置片段、旧接管备份残留这三类数据的迁移样本。原有的 `tests/mycodex_host_core.rs`、`tests/mycodex_gui.rs` 针对 v3 协议，在本分支上预期失败，第二阶段重写。
+- **迁移验证（真实数据副本，2026-10-10，经维护者同意）**：在临时目录复制 Windows 目标的私有库和 `config.toml`、`auth.json`，只改副本里绑定的目标路径；副本中的刷新令牌全部换成无效占位值，并给测试宿主设置不可达的代理，避免任何刷新令牌被轮换；验证结束后删除副本。数据：4 个供应商（2 个 ChatGPT 托管账号，其中一个为当前；2 个第三方原生 Responses），一份 5,722 字符的通用配置片段，无路由接管和旧接管备份。结果：
+  - 启动后列表、当前供应商、直连模式正确，`config.toml` 和 `auth.json` 逐字节不变（未接管时 Codex 启动只记录模式状态，不写客户端文件，也不取托管账号令牌）。
+  - 在断网条件下切到第三方供应商成功：用户的 15 项顶层设置和表（`mcp_servers`、`hooks`、`plugins`、`projects`、`features`、`memories`、`marketplaces` 等）全部不变，只替换 `model`、新增 `model_provider = "custom"`、`[model_providers.custom]` 和 `model_catalog_json`。通用配置片段的内容本来就在 `config.toml` 里，没有丢失。
+  - 从托管账号切到第三方时 `auth.json` 被移除，托管登录标记文件被清理；登录暂存、`live-state.json`、首次写入备份、数据库备份都写在私有存储内，“家目录”保持为空。
+  - 切回托管账号需要用刷新令牌换取访问令牌（托管账号库只存刷新令牌）；在上述保护下按预期失败，且失败后客户端文件不变。正常环境下这一步需要联网。
+- **尚未完成**：旧接管备份残留和路由模式下的迁移样本（用 0.2.3 常驻模式生成合成数据），第二阶段与路由重建一起验证。原有的 `tests/mycodex_host_core.rs`、`tests/mycodex_gui.rs` 针对 v3 协议，在本分支上预期失败，第二阶段重写。
 
 ## 主要风险
 
@@ -169,3 +174,4 @@
 | --- | --- | --- |
 | 2026-10-10 | 规划 | 本方案定稿 |
 | 2026-10-10 | 第一阶段 | 建 `port/v4` 并合并 v4.0.5；宿主在 v4 上编译；设备目录重定向；只启动 Codex；最小链路和合成数据迁移测试通过；`runtime/prepare` 评估为保留 |
+| 2026-10-10 | 第一阶段 | 真实私有库副本迁移验证通过（结果见“第一阶段发现”）；`port/v4` 推送到 GitHub |
