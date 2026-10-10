@@ -1,8 +1,8 @@
 //! Target-local management transport. One connection carries one request.
 #[cfg(unix)]
-pub(super) use unix::{lock_request_instance, rpc, serve};
+pub(super) use unix::{rpc, serve};
 #[cfg(windows)]
-pub(super) use windows::{lock_request_instance, rpc, serve};
+pub(super) use windows::{rpc, serve};
 
 use super::identity::PROTOCOL_VERSION;
 use serde_json::Value;
@@ -124,10 +124,6 @@ mod unix {
         Ok(file)
     }
 
-    pub(crate) fn lock_request_instance() -> Result<File, &'static str> {
-        lock_instance()
-    }
-
     pub(crate) fn serve() -> Result<(), &'static str> {
         let runtime = runtime()?;
         let _entered = runtime.enter();
@@ -145,7 +141,7 @@ mod unix {
         let paths = runtime_paths().ok_or("runtime_not_initialized")?;
         let _store = lock_store(paths)?;
         let state = initialize_state()?;
-        super::super::lifecycle::restore(&state)?;
+        super::super::lifecycle::startup(&state.state)?;
         output(&super::super::identity::ready()?)?;
         runtime.block_on(async {
             loop {
@@ -167,7 +163,7 @@ mod unix {
                             // Keep synchronous upstream services off the async driver thread.
                             let state = std::sync::Arc::clone(&state);
                             let response =
-                                tokio::task::spawn_blocking(move || dispatch(&state, &input, true))
+                                tokio::task::spawn_blocking(move || dispatch(&state, &input))
                                     .await
                                     .map_err(|_| "request_failed")?;
                             shutdown = response["result"]["status"] == "shutting_down";
@@ -280,11 +276,6 @@ mod windows {
         create_instance(user, true)
     }
 
-    pub(crate) fn lock_request_instance() -> Result<NamedPipeServer, &'static str> {
-        let (_, instance) = acquire_instance(&CurrentUserSecurity::new()?)?;
-        Ok(instance)
-    }
-
     fn create_instance(
         user: &CurrentUserSecurity,
         first: bool,
@@ -315,7 +306,7 @@ mod windows {
         let paths = runtime_paths().ok_or("runtime_not_initialized")?;
         let _store = lock_store(paths)?;
         let state = initialize_state()?;
-        super::super::lifecycle::restore(&state)?;
+        super::super::lifecycle::startup(&state.state)?;
         output(&super::super::identity::ready()?)?;
         runtime.block_on(async {
             loop {
@@ -341,7 +332,7 @@ mod windows {
                             // Keep synchronous upstream services off the async driver thread.
                             let state = std::sync::Arc::clone(&state);
                             let response =
-                                tokio::task::spawn_blocking(move || dispatch(&state, &input, true))
+                                tokio::task::spawn_blocking(move || dispatch(&state, &input))
                                     .await
                                     .map_err(|_| "request_failed")?;
                             shutdown = response["result"]["status"] == "shutting_down";

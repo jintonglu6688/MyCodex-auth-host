@@ -1481,6 +1481,14 @@ pub async fn startup(state: &AppState) {
     codex_client_catalog::observe(&DeviceStore::for_device());
 }
 
+/// MyCodex: a headless host owns one Codex target and must never restore other apps.
+pub(crate) async fn startup_single(state: &AppState, app: &AppType) -> Result<(), String> {
+    let _guard = lock_settled(state, app)
+        .await
+        .map_err(|error| error.to_string())?;
+    startup_app(state, app).await
+}
+
 async fn startup_app(state: &AppState, app: &AppType) -> Result<(), String> {
     let had_backup = drain_legacy_backup(state, app).await;
     let mut mode = current::mode_state(app);
@@ -1569,9 +1577,9 @@ async fn drain_legacy_backup(state: &AppState, app: &AppType) -> bool {
             return false;
         }
     };
-    let dir = crate::config::get_home_dir()
-        .join(".cc-switch")
-        .join("backups")
+    // MyCodex: follow the device store so a headless host stays inside its target store.
+    let dir = DeviceStore::for_device()
+        .file("backups")
         .join("proxy-live-backup");
     let stamp = chrono::Utc::now().format("%Y%m%dT%H%M%SZ");
     let path = dir.join(format!("{}-{stamp}.json", app.as_str()));

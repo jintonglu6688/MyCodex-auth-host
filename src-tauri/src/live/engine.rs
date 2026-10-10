@@ -33,6 +33,10 @@ pub struct DeviceStore {
 
 impl DeviceStore {
     pub fn for_device() -> Self {
+        // MyCodex: each headless host keeps device state in its own target store.
+        if let Some(paths) = crate::mycodex_host::runtime_paths() {
+            return Self::at(paths.data_dir.clone());
+        }
         Self::at(crate::config::get_home_dir().join(".cc-switch"))
     }
 

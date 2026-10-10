@@ -1,27 +1,23 @@
 //! Minimal Codex-only stdio adapter over the original service layer.
 //! No desktop bootstrap or parallel provider persistence engine.
-use crate::{AppState, AppType, Database, McpService, Provider, ProviderService};
+//!
+//! Phase 1 of docs/mycodex-auth-v4-port.md: this host runs on the v4 kernel
+//! with a reduced protocol. The v3 adapter modules (`accounts`, `auto_capture`,
+//! `gui*`, `runtime_config`) stay in the tree but are not compiled until phase 2
+//! rebuilds them on the v4 key-field and mode services.
+use crate::{AppState, AppType, Database, Provider, ProviderService};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::ffi::OsString;
 use std::fs::{File, OpenOptions};
-use std::io::{Read, Write};
+use std::io::Write;
 use std::path::PathBuf;
 use std::sync::{Arc, OnceLock};
 
-mod accounts;
-pub(crate) mod auto_capture;
-mod gui;
-mod gui_accounts;
-mod gui_catalog;
-mod gui_config;
-mod gui_mcp;
-mod gui_provider;
 mod identity;
 mod ipc;
 pub(crate) mod lifecycle;
 mod paths;
-mod runtime_config;
 mod security;
 
 type Result<T> = std::result::Result<T, &'static str>;
@@ -51,7 +47,6 @@ struct Request {
 
 pub(super) struct Host {
     state: AppState,
-    gui: std::sync::Mutex<gui::Session>,
 }
 
 pub fn run(mut args: impl Iterator<Item = OsString>) -> Result<()> {
@@ -66,7 +61,7 @@ pub fn run(mut args: impl Iterator<Item = OsString>) -> Result<()> {
     if command == "--paths-json" {
         return output(&paths::resolve(args)?);
     }
-    if !matches!(command, "request" | "serve" | "rpc") {
+    if !matches!(command, "serve" | "rpc") {
         return Err("invalid_arguments");
     }
     let mut data_dir = None;
@@ -95,7 +90,7 @@ pub fn run(mut args: impl Iterator<Item = OsString>) -> Result<()> {
     {
         return Err("overlapping_directories");
     }
-    if command != "rpc" {
+    if command == "serve" {
         // Native services create credential-bearing files under the private store.
         #[cfg(unix)]
         unsafe {
@@ -106,31 +101,17 @@ pub fn run(mut args: impl Iterator<Item = OsString>) -> Result<()> {
     PATHS
         .set(paths)
         .map_err(|_| "runtime_already_initialized")?;
-    let paths = runtime_paths().ok_or("runtime_not_initialized")?;
     if command == "serve" {
         return ipc::serve();
     }
     let mut bytes = Vec::new();
-    std::io::stdin()
-        .take(MAX_REQUEST as u64 + 1)
-        .read_to_end(&mut bytes)
-        .map_err(|_| "input_failed")?;
+    std::io::Read::read_to_end(
+        &mut std::io::Read::take(std::io::stdin(), MAX_REQUEST as u64 + 1),
+        &mut bytes,
+    )
+    .map_err(|_| "input_failed")?;
     parse_request(&bytes)?;
-    if command == "rpc" {
-        return output(&ipc::rpc(&bytes)?);
-    }
-    let runtime = tokio::runtime::Runtime::new().map_err(|_| "runtime_failed")?;
-    let _entered = runtime.enter();
-    // All writers use target -> store lock order, including the offline probe.
-    let _instance = ipc::lock_request_instance()?;
-    let _lock = lock_store(paths)?;
-    // This offline probe uses native auth.json fixtures. Managed OAuth requires
-    // a resident host; do not silently accept an existing account archive here.
-    if paths.data_dir.join("codex_oauth_auth.json").exists() {
-        return Err("managed_oauth_not_supported_in_probe");
-    }
-    let host = initialize_state()?;
-    output(&dispatch(&host, &bytes, false))
+    output(&ipc::rpc(&bytes)?)
 }
 
 fn initialize_state() -> Result<Arc<Host>> {
@@ -156,10 +137,7 @@ fn initialize_state() -> Result<Arc<Host>> {
         _ => (),
     }
     lifecycle::configure(&state)?;
-    Ok(Arc::new(Host {
-        state,
-        gui: Default::default(),
-    }))
+    Ok(Arc::new(Host { state }))
 }
 
 fn parse_request(bytes: &[u8]) -> Result<Request> {
@@ -176,14 +154,14 @@ fn parse_request(bytes: &[u8]) -> Result<Request> {
     Ok(request)
 }
 
-fn dispatch(host: &Host, bytes: &[u8], resident: bool) -> Value {
+fn dispatch(host: &Host, bytes: &[u8]) -> Value {
     let request = match parse_request(bytes) {
         Ok(request) => request,
         Err(code) => {
             return json!({"jsonrpc":"2.0","id":null,"error":{"code":-32600,"message":code}})
         }
     };
-    match handle(host, &request, resident) {
+    match handle(host, &request) {
         Ok(result) => json!({"jsonrpc":"2.0", "id":request.id, "result":result}),
         Err(code) => json!({"jsonrpc":"2.0", "id":request.id,
             "error":{"code":-32000,"message":code}}),
@@ -196,257 +174,48 @@ fn output(response: &Value) -> Result<()> {
     writeln!(stdout).map_err(|_| "output_failed")
 }
 
-fn handle(host: &Host, request: &Request, resident: bool) -> Result<Value> {
+fn handle(host: &Host, request: &Request) -> Result<Value> {
     let state = &host.state;
     let p = &request.params;
-    if matches!(
-        request.method.as_str(),
-        "provider/add"
-            | "provider/update"
-            | "provider/switch"
-            | "gui/provider/save"
-            | "gui/config/common/save"
-            | "gui/provider/copy"
-            | "gui/provider/delete"
-            | "gui/provider/apply"
-            | "gui/provider/preflight"
-            | "gui/account/delete"
-            | "account/remove"
-            | "backend/shutdown"
-            | "mcp/import"
-            | "gui/mcp/import"
-            | "gui/mcp/save"
-            | "gui/mcp/delete"
-    ) {
-        lifecycle::pause_if_external(state);
-    }
     match request.method.as_str() {
         "status" => {
             let mut value = identity::target_identity()?;
-            value["stage"] = json!(if resident {
-                "upstream-core-resident"
-            } else {
-                "upstream-core-probe"
-            });
-            value["capabilities"] = json!(if resident {
-                vec![
-                    "codexNativeServices",
-                    "codexManagedAccounts",
-                    "codexConversionLifecycle",
-                    "commonConfig",
-                    "contextSettings",
-                    "configEditing",
-                    "guiProviderManagement",
-                    "guiMcpManagement",
-                    "globalAuthCapture",
-                    "runtimeConfigPreparation",
-                ]
-            } else {
-                vec!["codexNativeServices"]
-            });
+            value["stage"] = json!("upstream-core-resident");
+            value["capabilities"] = json!(Vec::<&str>::new());
             value["route"] = lifecycle::status(state)?;
             Ok(value)
         }
-        "runtime/prepare" if resident => runtime_config::prepare(),
-        "provider/list" => {
-            let captured = auto_capture::read(state)?;
+        // Read-only list for phase 1; phase 2 restores capture and editing.
+        "gui/provider/list" => {
             let providers = ProviderService::list(state, AppType::Codex).map_err(service_error)?;
-            let current = captured.current;
+            let current = ProviderService::current(state, AppType::Codex).map_err(service_error)?;
             Ok(json!({"currentProviderId":current,
                 "providers":providers.values().map(summary).collect::<Result<Vec<_>>>()?}))
         }
-        "provider/live" => {
-            let settings =
-                ProviderService::read_live_settings(AppType::Codex).map_err(service_error)?;
-            configuration_summary(&settings)
-        }
-        "provider/add" | "provider/update" => {
-            let provider: Provider =
-                serde_json::from_value(p["provider"].clone()).map_err(|_| "invalid_provider")?;
-            let _guard = lifecycle::mutation()?;
-            if !resident {
-                require_native_state(state)?;
-                require_direct(&provider)?;
-            }
-            auto_capture::before_write(state)?;
-            lifecycle::conversion(&provider)?;
-            let id = provider.id.clone();
-            if request.method == "provider/add"
-                && state
-                    .db
-                    .get_provider_by_id(&id, "codex")
-                    .map_err(service_error)?
-                    .is_some()
-            {
-                return Err("provider_already_exists");
-            }
-            let current = ProviderService::current(state, AppType::Codex).map_err(service_error)?;
-            let affects_live =
-                current == id || (request.method == "provider/add" && current.is_empty());
-            if resident && affects_live {
-                lifecycle::prepare(state, &provider)?;
-            }
-            let changed = if request.method == "provider/add" {
-                // Keep upstream first-provider activation semantics unchanged.
-                ProviderService::add(state, AppType::Codex, provider, false).map_err(service_error)
-            } else {
-                ProviderService::update(state, AppType::Codex, None, provider)
-                    .map_err(service_error)
-            };
-            if resident && affects_live && changed.is_err() {
-                lifecycle::stop_listener(state)?;
-            }
-            changed?;
-            if resident && affects_live {
-                lifecycle::reconcile(state)?;
-            }
-            summary(
-                &state
-                    .db
-                    .get_provider_by_id(&id, "codex")
-                    .map_err(service_error)?
-                    .ok_or("provider_not_found")?,
-            )
-        }
+        // Temporary phase 1 direct switch; phase 2 replaces it with gui/provider/apply.
         "provider/switch" => {
             let id = p["providerId"].as_str().ok_or("invalid_params")?;
-            let provider = state
+            let _guard = lifecycle::mutation()?;
+            state
                 .db
                 .get_provider_by_id(id, "codex")
                 .map_err(service_error)?
                 .ok_or("provider_not_found")?;
-            let _guard = lifecycle::mutation()?;
-            if !resident {
-                require_native_state(state)?;
-                require_direct(&provider)?;
-            }
-            auto_capture::before_write(state)?;
-            if resident {
-                lifecycle::prepare(state, &provider)?;
-            }
             let switched =
-                ProviderService::switch(state, AppType::Codex, id).map_err(service_error);
-            if resident && switched.is_err() {
-                lifecycle::stop_listener(state)?;
-            }
-            let switched = switched?;
-            if resident {
-                lifecycle::reconcile(state)?;
-            }
-            // Warnings may contain upstream-controlled text. Expose only their
-            // count at this stage; do not leak config or credentials via errors.
+                ProviderService::switch(state, AppType::Codex, id).map_err(service_error)?;
+            // Warnings may contain upstream-controlled text; expose only their count.
             Ok(json!({"providerId":id,"warningCount":switched.warnings.len()}))
         }
-        "mcp/import" => {
-            let _guard = lifecycle::mutation()?;
-            auto_capture::before_write(state)?;
-            require_native_state(state)?;
-            Ok(json!({"imported":McpService::import_from_codex(state).map_err(service_error)?}))
-        }
-        "backend/shutdown" if resident => {
-            let for_update = p
-                .get("forUpdate")
+        "backend/shutdown" => {
+            p.get("forUpdate")
                 .map(|v| v.as_bool().ok_or("invalid_params"))
                 .transpose()?;
             let _guard = lifecycle::mutation()?;
-            if gui_accounts::login_pending(host)? {
-                return Err("login_in_progress");
-            }
-            let owns_live = lifecycle::owns_live(state).unwrap_or(false);
-            if for_update == Some(false)
-                && owns_live
-                && lifecycle::status(state)?["takeover"] == true
-            {
-                return Err("route_required");
-            }
-            if for_update == Some(true) {
-                // Keep the native takeover and backup for the replacement process.
-                // Its startup rechecks external ownership before restoring the route.
-                lifecycle::stop_listener(state)?;
-            } else if owns_live {
-                lifecycle::stop(state)?;
-            } else {
-                lifecycle::stop_listener(state)?;
-            }
+            lifecycle::stop_listener(state)?;
             Ok(json!({"status":"shutting_down"}))
         }
-        method if method.starts_with("account/") && resident => accounts::handle(state, method, p),
-        method if method.starts_with("gui/") && resident => gui::handle(host, method, p),
         _ => Err("method_not_supported"),
     }
-}
-
-fn require_native_state(state: &AppState) -> Result<()> {
-    let global =
-        futures::executor::block_on(state.db.get_global_proxy_config()).map_err(service_error)?;
-    let app = futures::executor::block_on(state.db.get_proxy_config_for_app("codex"))
-        .map_err(service_error)?;
-    let backup =
-        futures::executor::block_on(state.db.get_live_backup("codex")).map_err(service_error)?;
-    if global.proxy_enabled || app.enabled || app.auto_failover_enabled || backup.is_some() {
-        return Err("route_takeover_not_supported_in_probe");
-    }
-    if crate::codex_config::get_codex_config_path().exists()
-        || crate::codex_config::get_codex_auth_path().exists()
-    {
-        ProviderService::read_live_settings(AppType::Codex).map_err(service_error)?;
-    }
-    if state
-        .proxy_service
-        .detect_takeover_in_live_config_for_app(&AppType::Codex)
-    {
-        return Err("route_takeover_not_supported_in_probe");
-    }
-    Ok(())
-}
-
-fn require_direct(provider: &Provider) -> Result<()> {
-    if provider.uses_managed_account_auth()
-        || provider
-            .meta
-            .as_ref()
-            .and_then(|m| m.auth_binding.as_ref())
-            .is_some_and(|b| b.source == crate::provider::AuthBindingSource::ManagedAccount)
-    {
-        return Err("managed_oauth_not_supported_in_probe");
-    }
-    let formats = [
-        provider.meta.as_ref().and_then(|m| m.api_format.as_deref()),
-        provider.settings_config["apiFormat"].as_str(),
-        provider.settings_config["api_format"].as_str(),
-    ];
-    if formats
-        .into_iter()
-        .flatten()
-        .any(|format| format != "openai_responses")
-        || crate::proxy::providers::resolve_codex_catalog_tool_profile(provider)
-            != crate::codex_config::CodexCatalogToolProfile::NativeResponses
-    {
-        return Err("conversion_not_supported_in_probe");
-    }
-    let config_text = provider.settings_config["config"].as_str().unwrap_or("");
-    if provider.settings_config["auth"]["OPENAI_API_KEY"].as_str() == Some("PROXY_MANAGED")
-        || crate::codex_config::extract_codex_experimental_bearer_token(config_text).as_deref()
-            == Some("PROXY_MANAGED")
-        || crate::codex_config::codex_config_has_official_proxy_route(config_text)
-    {
-        return Err("route_takeover_not_supported_in_probe");
-    }
-    let config: toml::Value = toml::from_str(config_text).map_err(|_| "invalid_provider")?;
-    let source = config
-        .get("model_provider")
-        .and_then(toml::Value::as_str)
-        .unwrap_or("openai");
-    let wire = config
-        .get("model_providers")
-        .and_then(|v| v.get(source))
-        .and_then(|v| v.get("wire_api"))
-        .or_else(|| config.get("wire_api"))
-        .and_then(toml::Value::as_str);
-    if wire.is_some_and(|wire| wire != "responses") {
-        return Err("conversion_not_supported_in_probe");
-    }
-    Ok(())
 }
 
 fn configuration_summary(settings: &Value) -> Result<Value> {
@@ -462,8 +231,6 @@ fn summary(provider: &Provider) -> Result<Value> {
     let mut result = configuration_summary(&provider.settings_config)?;
     result["id"] = json!(provider.id);
     result["name"] = json!(provider.name);
-    result["commonConfigEnabled"] =
-        json!(provider.meta.as_ref().and_then(|m| m.common_config_enabled));
     Ok(result)
 }
 

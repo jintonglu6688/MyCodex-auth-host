@@ -86,8 +86,8 @@
 | `gui/config/provider/preview` | 改为 v4 编辑器预览：返回切换后的 `config.toml` 和冲突信息 |
 | `gui/preset/list`、`gui/model/fetch`、`gui/mcp/*`、`gui/account/*` | 保留 |
 | `backend/shutdown` | 保留；`forUpdate` 改为保留模式状态，供替换进程恢复 |
-| `runtime/prepare` | 视第一阶段评估 |
-| `provider/*`、`account/*`（非 `gui/` 前缀）、`mcp/import`、离线 `request` 命令 | 前端不使用；第一阶段确认只被测试使用后删除 |
+| `runtime/prepare` | 保留（第一阶段结论见下文“第一阶段发现”） |
+| `provider/*`、`account/*`（非 `gui/` 前缀）、`mcp/import`、离线 `request` 命令 | 已确认前端不使用，第一阶段已删除；`provider/switch` 作为第一阶段临时入口保留，第二阶段由 `gui/provider/apply` 取代 |
 
 ### 前端受影响的位置
 
@@ -140,6 +140,19 @@
 2. 前端更新 Windows 内置包和远端固定值（标签、源码提交、各平台哈希、接受的后端版本），重新构建和打包。
 3. 验收：Windows 内置后端、WSL、SSH（Linux、macOS）三类目标从 0.2.3 升级到 0.3.0 后，原认证存档保留、当前供应商正确、ChatGPT 直连和转换路由都能新建会话；多个客户端（Dev 与 Stable）共用后端时生命周期正常。
 
+## 第一阶段发现
+
+分支 `port/v4`：合并提交 `5b31fcfc`（v4.0.5 = `a98207e2`），之后的提交让宿主在 v4 上编译并跑通最小链路。
+
+- **合并冲突只有 7 个文件**：`codex_config.rs`、`mcp/codex.rs`、`services/provider/live.rs`、`services/provider/mod.rs`、`services/proxy.rs` 取上游；两个 CI 工作流保留本仓库只能手动触发的版本，与上游 CI 的差异另行核对。`config.rs`、`settings.rs`、`http_client.rs`、`server.rs`、`codex_oauth_auth.rs`、`Cargo.toml` 的补丁自动合并成功。
+- **只启动 Codex**：`mode::controller::startup` 遍历所有应用，对没有模式记录的应用写入直连配置。宿主改用新增的 `startup_single`，只处理 Codex；中断写入的补完仍用 `mode::operation::recover_on_startup`。
+- **设备目录**：`DeviceStore::for_device()` 和 `drain_legacy_backup` 已重定向到 `--data-dir`。测试用空“家目录”证明宿主不写目标以外的位置；v4 的 `live-state.json` 写在私有存储内。
+- **第三方路由表固定为 `custom`**：v4 把所有第三方供应商写成 `model_provider = "custom"` 和 `[model_providers.custom]`，3.x 用的是供应商自己的 ID。MyCodex 列会话时传 `modelProviders: []`，不按供应商过滤，旧会话不会消失；Codex CLI 等按当前供应商过滤的入口会把 3.x 的会话和新会话分开。第二阶段核对 v4 的会话历史统一功能是否覆盖这种情况，并在迁移说明里写明。
+- **`runtime/prepare` 仍需要**：v4 把 `disable_response_storage` 列为关键字段（`live/project/codex.rs` 的 `ROW_TOP_FIELDS`），供应商行里有这个键时切换会写回 `config.toml`，而这正是此前用 `normalize_live_config` 清除的遗留设置。第二阶段在宿主投影中排除它，并保留启动前清理（含 MCP 表里的 `type`）。
+- **登录导入**：`extract_codex_managed_oauth_account_id` 在 v4 中是私有函数，且只接受显式的 `auth_mode = "chatgpt"`；已恢复为 `pub(crate)` 并接受旧式隐式 ChatGPT 登录形状。浏览器登录和导入代码暂时没有调用方（账号模块在第一阶段未编译），第二阶段接回。
+- **迁移验证（合成数据）**：用校验过的 0.2.3 发布版（SHA-256 `785c44dc…`）生成 3.x 私有库和 `config.toml`，再加入用户自己的顶层设置、注释和 MCP 表；v4 宿主启动后列表和当前供应商正确，直连切换只替换关键字段，用户内容逐字节保留。见 `src-tauri/tests/mycodex_host_v4.rs`，设置 `MYCODEX_V3_HOST` 指向 0.2.3 程序后运行，否则跳过。
+- **尚未完成**：真实私有库副本的迁移验证（含令牌，需单独确认后在临时目录进行）；托管账号、通用配置片段、旧接管备份残留这三类数据的迁移样本。原有的 `tests/mycodex_host_core.rs`、`tests/mycodex_gui.rs` 针对 v3 协议，在本分支上预期失败，第二阶段重写。
+
 ## 主要风险
 
 | 风险 | 应对 |
@@ -154,4 +167,5 @@
 
 | 日期 | 阶段 | 内容 |
 | --- | --- | --- |
-| 2026-10-10 | 规划 | 本方案定稿；尚未开始第一阶段 |
+| 2026-10-10 | 规划 | 本方案定稿 |
+| 2026-10-10 | 第一阶段 | 建 `port/v4` 并合并 v4.0.5；宿主在 v4 上编译；设备目录重定向；只启动 Codex；最小链路和合成数据迁移测试通过；`runtime/prepare` 评估为保留 |

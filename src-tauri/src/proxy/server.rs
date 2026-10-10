@@ -116,7 +116,9 @@ impl ProxyServer {
         // 构建路由
         let app = self.build_router();
         let app = if crate::mycodex_host::runtime_paths().is_some() {
-            app.layer(axum::middleware::from_fn(crate::mycodex_host::lifecycle::admit))
+            app.layer(axum::middleware::from_fn(
+                crate::mycodex_host::lifecycle::admit,
+            ))
         } else {
             app
         };

@@ -303,7 +303,7 @@ pub(crate) fn codex_managed_oauth_live_auth_marker_exists() -> bool {
 /// 托管账号写入的完整 bundle 会额外带 `tokens.refresh_token` 与顶层 `last_refresh`，
 /// 这里一并容忍。Codex CLI 自刷新会轮换 access_token，因此短期 token 指纹不能
 /// 作为稳定的所有权谓词；cc-switch 的本地账号 ID 单独记录在 marker 中。
-fn extract_codex_managed_oauth_account_id(auth: &Value) -> Option<String> {
+pub(crate) fn extract_codex_managed_oauth_account_id(auth: &Value) -> Option<String> {
     let auth_obj = auth.as_object()?;
 
     if auth_obj.keys().any(|key| {
@@ -315,7 +315,12 @@ fn extract_codex_managed_oauth_account_id(auth: &Value) -> Option<String> {
         return None;
     }
 
-    if auth.get("auth_mode").and_then(|value| value.as_str()) != Some("chatgpt") {
+    // MyCodex: accept explicit and legacy implicit ChatGPT login shapes;
+    // API-key and external-token modes remain excluded.
+    if !matches!(
+        codex_auth_resolved_mode(auth_obj),
+        CodexResolvedAuthMode::Chatgpt
+    ) {
         return None;
     }
 
