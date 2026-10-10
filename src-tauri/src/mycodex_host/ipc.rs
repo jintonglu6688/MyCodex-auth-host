@@ -60,6 +60,7 @@ mod unix {
     const IO_TIMEOUT: Duration = Duration::from_secs(2);
     const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
     const RESPONSE_TIMEOUT: Duration = Duration::from_secs(90);
+    const ENDPOINT_CHECK: Duration = Duration::from_secs(10);
 
     fn endpoint_dir() -> Result<PathBuf, &'static str> {
         let paths = runtime_paths().ok_or("runtime_not_initialized")?;
@@ -124,28 +125,114 @@ mod unix {
         Ok(file)
     }
 
-    pub(crate) fn serve() -> Result<(), &'static str> {
-        let runtime = runtime()?;
-        let _entered = runtime.enter();
-        let _instance = lock_instance()?;
-        let path = socket_path()?;
-        if let Ok(metadata) = fs::symlink_metadata(&path) {
+    fn file_identity(metadata: &fs::Metadata) -> (u64, u64) {
+        (metadata.dev(), metadata.ino())
+    }
+
+    fn bind_socket(path: &Path) -> Result<(UnixListener, (u64, u64)), &'static str> {
+        if let Ok(metadata) = fs::symlink_metadata(path) {
             if !metadata.file_type().is_socket() || !owned_private(&metadata) {
                 return Err("ipc_security_failed");
             }
-            fs::remove_file(&path).map_err(|_| "ipc_security_failed")?;
+            fs::remove_file(path).map_err(|_| "ipc_security_failed")?;
         }
-        let listener = UnixListener::bind(&path).map_err(|_| "ipc_failed")?;
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o600))
+        let listener = UnixListener::bind(path).map_err(|_| "ipc_failed")?;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600))
             .map_err(|_| "ipc_security_failed")?;
+        let metadata = fs::symlink_metadata(path).map_err(|_| "ipc_failed")?;
+        Ok((listener, file_identity(&metadata)))
+    }
+
+    fn touch(path: &Path) {
+        if let Ok(path) = std::ffi::CString::new(path.as_os_str().as_bytes()) {
+            // SAFETY: path is a valid C string; null times set access and modification to now.
+            unsafe { libc::utimes(path.as_ptr(), std::ptr::null()) };
+        }
+    }
+
+    /// The resident's files under /tmp. macOS `tmp_cleaner` and systemd-tmpfiles
+    /// remove entries that stay idle for days, which would leave a long-running
+    /// resident unreachable while it still holds the store.
+    struct Endpoint {
+        listener: UnixListener,
+        socket: (u64, u64),
+        lock: File,
+    }
+
+    impl Endpoint {
+        /// Keep the files fresh and restore the lock or socket if they were removed.
+        fn maintain(&mut self) {
+            let Ok(directory) = endpoint_dir() else {
+                return;
+            };
+            let lock_path = directory.join("management.lock");
+            let socket_path = directory.join("management.sock");
+            let lock_current = matches!(
+                (fs::symlink_metadata(&lock_path), self.lock.metadata()),
+                (Ok(on_disk), Ok(held)) if file_identity(&on_disk) == file_identity(&held)
+            );
+            if !lock_current {
+                // A process that briefly holds a recreated lock is retried next time.
+                match lock_instance() {
+                    Ok(lock) => self.lock = lock,
+                    Err(_) => return,
+                }
+            }
+            let socket_current = matches!(
+                fs::symlink_metadata(&socket_path),
+                Ok(metadata) if file_identity(&metadata) == self.socket
+            );
+            if !socket_current {
+                if let Ok((listener, socket)) = bind_socket(&socket_path) {
+                    self.listener = listener;
+                    self.socket = socket;
+                }
+            }
+            for path in [&directory, &lock_path, &socket_path] {
+                touch(path);
+            }
+        }
+    }
+
+    enum Event {
+        Client(UnixStream),
+        Check,
+    }
+
+    pub(crate) fn serve() -> Result<(), &'static str> {
+        let runtime = runtime()?;
+        let _entered = runtime.enter();
+        let lock = lock_instance()?;
         let paths = runtime_paths().ok_or("runtime_not_initialized")?;
-        let _store = lock_store(paths)?;
+        // Take the store before replacing the socket, so a second process can
+        // never disconnect the resident that already owns this target.
+        let _store = lock_store(paths).map_err(|_| "backend_already_running")?;
+        let (listener, socket) = bind_socket(&socket_path()?)?;
+        let mut endpoint = Endpoint {
+            listener,
+            socket,
+            lock,
+        };
         let state = initialize_state()?;
         super::super::lifecycle::startup(&state.state)?;
         output(&super::super::identity::ready()?)?;
         runtime.block_on(async {
+            let mut check = tokio::time::interval(ENDPOINT_CHECK);
+            check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             loop {
-                let (mut stream, _) = listener.accept().await.map_err(|_| "ipc_failed")?;
+                let event = tokio::select! {
+                    accepted = endpoint.listener.accept() => {
+                        Event::Client(accepted.map_err(|_| "ipc_failed")?.0)
+                    }
+                    _ = check.tick() => Event::Check,
+                };
+                let mut stream = match event {
+                    Event::Client(stream) => stream,
+                    Event::Check => {
+                        endpoint.maintain();
+                        continue;
+                    }
+                };
                 let mut shutdown = false;
                 if let Ok(Ok(bytes)) =
                     tokio::time::timeout(IO_TIMEOUT, read_frame(&mut stream)).await

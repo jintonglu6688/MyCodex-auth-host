@@ -228,7 +228,7 @@ impl Resident {
         assert_eq!(ready["event"], "ready");
         assert_eq!(ready["protocolVersion"], protocol);
         if protocol == 3 {
-            assert_eq!(ready["hostVersion"], "0.3.0");
+            assert_eq!(ready["hostVersion"], "0.3.1");
             assert_eq!(
                 ready["sourceRevision"],
                 env!("MYCODEX_CORE_SOURCE_REVISION")
@@ -330,7 +330,7 @@ fn build_identity_is_independent_of_runtime_checkout_and_matches_resident() {
     assert!(output.status.success());
     let identity: Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(identity["protocolVersion"], 3);
-    assert_eq!(identity["hostVersion"], "0.3.0");
+    assert_eq!(identity["hostVersion"], "0.3.1");
     assert_eq!(
         identity["sourceRevision"],
         env!("MYCODEX_CORE_SOURCE_REVISION")
@@ -418,6 +418,51 @@ fn a_second_resident_for_the_same_target_is_refused() {
     assert_eq!(p.serve_failure(&other, &p.codex), "backend_already_running");
     assert!(!other.join("cc-switch.db").exists());
     assert_eq!(p.live_text(), before);
+    resident.shutdown(&p, json!({}));
+}
+
+#[cfg(unix)]
+fn endpoint_dir(p: &Probe) -> PathBuf {
+    use sha2::{Digest, Sha256};
+    use std::os::unix::ffi::OsStrExt;
+    let codex = p.codex.canonicalize().unwrap();
+    let digest = format!("{:x}", Sha256::digest(codex.as_os_str().as_bytes()));
+    // SAFETY: geteuid has no preconditions.
+    let uid = unsafe { libc::geteuid() };
+    PathBuf::from("/tmp").join(format!("mycodex-auth-core-{uid}-{}", &digest[..32]))
+}
+
+#[cfg(unix)]
+#[test]
+fn resident_restores_endpoint_files_removed_from_tmp() {
+    let p = Probe::new();
+    let resident = Resident::start(&p);
+    p.save(direct("native"));
+    let endpoint = endpoint_dir(&p);
+    assert!(endpoint.join("management.sock").exists());
+    // macOS tmp_cleaner and systemd-tmpfiles delete idle files under /tmp.
+    fs::remove_file(endpoint.join("management.sock")).unwrap();
+    fs::remove_file(endpoint.join("management.lock")).unwrap();
+    // A second process must not replace the endpoint of the resident that owns the store.
+    assert_eq!(
+        p.serve_failure(&p.data, &p.codex),
+        "backend_already_running"
+    );
+    let status = br#"{"jsonrpc":"2.0","id":1,"method":"status","params":{}}"#;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(40);
+    loop {
+        let output = p.raw(status, &p.codex);
+        if output.status.success() {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "endpoint was not restored: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        std::thread::sleep(std::time::Duration::from_millis(500));
+    }
+    assert!(endpoint.join("management.lock").exists());
     resident.shutdown(&p, json!({}));
 }
 
