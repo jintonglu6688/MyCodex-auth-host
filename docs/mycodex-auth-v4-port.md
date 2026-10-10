@@ -203,6 +203,13 @@ Mac SSH 目标验收时“更新后台”失败，界面只显示通用失败。
 - 0.3.1 修复：`serve` 先取数据目录锁再动 socket，竞争进程以 `backend_already_running` 退出且不影响常驻；常驻每 10 秒刷新端点文件时间，并在锁或 socket 被删除、替换时自行重建。原生测试 `resident_restores_endpoint_files_removed_from_tmp` 在 macOS 和 Linux 上覆盖该场景。
 - 已陷入此状态的 0.2.x/0.3.0 常驻无法经协议恢复，需要在目标上结束旧的 `mycodex-auth-host` 进程（或重启）后再更新；前端为 `store_busy` 给出这一提示。
 
+## 后续：完整配置编辑器（0.3.2）
+
+- 新增能力 `fullConfigEditor`：`gui/config/provider/view` 返回切换到该供应商后的完整 `config.toml` 和不随切换生效的字段（v4 `editor_view`）；`gui/config/provider/preview` 带 `editorBase` 时按 v4 `plan_save` 拆分，返回供应商行 TOML 和 `globalChanges`。
+- `gui/provider/save` 带 `editor{base,text,onConflict}` 时先按三方比较写全局改动（`codex_editor::write_live`，只写用户改过的键）；默认拒绝冲突并返回 `editorConflict{keys}`，此时行和 `config.toml` 都不写；`keepMine`/`keepTheirs` 由前端冲突对话框选择后重试。不带 `editor` 的保存与之前完全相同。
+- 上游补丁只有两处：三个编辑器模块改为 `pub(crate)`；`TomlEdits::paths` 不再仅限测试。
+- 实测：推理摘要、详细程度、网页搜索在普通、路由、MiMo 之间切换都保留（回归测试 `mycodex_official_settings_survive_provider_switches`）；SudoCode.us 预设自带 `model_verbosity`，切过去会覆盖、切走会删除，是上游行为，暂未处理。
+
 ## 主要风险
 
 | 风险 | 应对 |

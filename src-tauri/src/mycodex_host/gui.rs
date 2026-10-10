@@ -191,12 +191,35 @@ pub(super) fn handle(host: &Host, method: &str, params: &Value) -> Result<Value>
                     return Err("account_not_found");
                 }
             }
+            // The full config editor's global edits are written first: a refused
+            // conflict then leaves both the row and config.toml untouched.
+            let mut global_written = false;
+            if let Some(editor) = params.get("editor") {
+                let on_conflict = serde_json::from_value(
+                    editor.get("onConflict").cloned().unwrap_or(json!("refuse")),
+                )
+                .map_err(|_| "invalid_params")?;
+                let plan = super::gui_config::plan(
+                    previous.as_ref(),
+                    &edited,
+                    &editor["base"],
+                    &editor["text"],
+                    on_conflict,
+                )?;
+                if !plan.edits.is_empty() {
+                    if let Err(keys) = super::gui_config::write_global(state, &plan.edits)? {
+                        return Ok(json!({"editorConflict":{"keys":keys}}));
+                    }
+                    global_written = true;
+                }
+            }
             let applied = persist(host, previous.as_ref(), edited)?;
             let stored = form::stored(state, id).map_err(|_| "save_outcome_unknown")?;
             let edited = form::snapshot(state, &stored).map_err(|_| "save_outcome_unknown")?;
             let mut result =
                 form::summary(state, &stored, &edited).map_err(|_| "save_outcome_unknown")?;
-            result["globalApplied"] = json!(applied);
+            // Global settings changed in config.toml also need the client to reload.
+            result["globalApplied"] = json!(applied || global_written);
             Ok(result)
         }
         "gui/provider/copy" => {

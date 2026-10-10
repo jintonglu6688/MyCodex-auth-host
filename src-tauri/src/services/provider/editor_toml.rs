@@ -115,8 +115,7 @@ impl TomlEdits {
         self.changes.is_empty()
     }
 
-    /// 改动的位置（`a.b`），按顺序。
-    #[cfg(test)]
+    /// 改动的位置（`a.b`），按顺序。MyCodex: the host reports them before saving.
     pub(crate) fn paths(&self) -> Vec<String> {
         self.changes
             .iter()

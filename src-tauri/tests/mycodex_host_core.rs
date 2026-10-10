@@ -228,7 +228,7 @@ impl Resident {
         assert_eq!(ready["event"], "ready");
         assert_eq!(ready["protocolVersion"], protocol);
         if protocol == 3 {
-            assert_eq!(ready["hostVersion"], "0.3.1");
+            assert_eq!(ready["hostVersion"], "0.3.2");
             assert_eq!(
                 ready["sourceRevision"],
                 env!("MYCODEX_CORE_SOURCE_REVISION")
@@ -330,7 +330,7 @@ fn build_identity_is_independent_of_runtime_checkout_and_matches_resident() {
     assert!(output.status.success());
     let identity: Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(identity["protocolVersion"], 3);
-    assert_eq!(identity["hostVersion"], "0.3.1");
+    assert_eq!(identity["hostVersion"], "0.3.2");
     assert_eq!(
         identity["sourceRevision"],
         env!("MYCODEX_CORE_SOURCE_REVISION")
@@ -421,6 +421,48 @@ fn a_second_resident_for_the_same_target_is_refused() {
     resident.shutdown(&p, json!({}));
 }
 
+#[test]
+fn mycodex_official_settings_survive_provider_switches() {
+    let p = Probe::new();
+    let resident = Resident::start(&p);
+    p.save(direct("base"));
+    p.save(direct("other"));
+    p.save(form(
+        "routed",
+        "chat_completions",
+        "https://routed.example.invalid/v1",
+        "routed-model",
+    ));
+    // MiMo is on the web-search reject list; its row does not set web_search.
+    p.save(form(
+        "mimo",
+        "responses",
+        "https://api.xiaomimimo.com/v1",
+        "mimo-v2-pro",
+    ));
+    let settings = "model_reasoning_summary = \"detailed\"\nmodel_verbosity = \"low\"\nweb_search = \"live\"\n";
+    fs::write(
+        p.codex.join("config.toml"),
+        format!("{settings}{}", p.live_text()),
+    )
+    .unwrap();
+    for id in ["other", "routed", "base", "mimo", "routed", "other"] {
+        p.apply(id);
+        let live = p.live();
+        for (key, value) in [
+            ("model_reasoning_summary", "detailed"),
+            ("model_verbosity", "low"),
+            ("web_search", "live"),
+        ] {
+            assert_eq!(
+                live[key].as_str(),
+                Some(value),
+                "{key} after switching to {id}"
+            );
+        }
+    }
+    resident.shutdown(&p, json!({}));
+}
 #[cfg(unix)]
 fn endpoint_dir(p: &Probe) -> PathBuf {
     use sha2::{Digest, Sha256};

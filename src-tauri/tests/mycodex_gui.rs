@@ -75,7 +75,7 @@ impl Gui {
         // Explicit raw editors can display credentials; errors and ordinary RPCs cannot.
         if !matches!(
             method,
-            "gui/config/provider/preview" | "gui/config/common/get"
+            "gui/config/provider/preview" | "gui/config/provider/view"
         ) || response.get("error").is_some()
         {
             assert!(!String::from_utf8_lossy(&output.stdout).contains("synthetic-secret"));
@@ -1097,6 +1097,221 @@ fn toml_provider_drafts_roundtrip_without_writing_until_save() {
             .unwrap()
             .len(),
         1
+    );
+}
+
+fn with(params: &Value, extra: Value) -> Value {
+    let mut params = params.clone();
+    for (key, value) in extra.as_object().unwrap() {
+        params[key] = value.clone();
+    }
+    params
+}
+
+fn rewrite_config(gui: &Gui, from: &str, to: &str) {
+    let path = gui.root.path().join("codex/config.toml");
+    let text = std::fs::read_to_string(&path).unwrap();
+    assert!(text.contains(from), "{from} missing from {text}");
+    std::fs::write(path, text.replace(from, to)).unwrap();
+}
+
+#[test]
+fn full_config_editor_writes_only_changed_global_settings() {
+    let mut gui = Gui::new();
+    gui.start();
+    let params = save("editor");
+    let saved = gui.ok("gui/provider/save", params.clone());
+    let params = with(&params, json!({"expectedVersion":saved["version"]}));
+    // MyCodex options and the user's own settings live only in config.toml.
+    let path = gui.root.path().join("codex/config.toml");
+    std::fs::write(
+        &path,
+        format!(
+            "model_reasoning_summary = \"auto\"\napproval_policy = \"on-request\"\nsandbox_mode = \"read-only\"\n{}",
+            gui.config()
+        ),
+    )
+    .unwrap();
+    let view = gui.ok("gui/config/provider/view", params.clone());
+    let base = view["text"].as_str().unwrap().to_string();
+    assert!(
+        base.contains("model_reasoning_summary = \"auto\""),
+        "{base}"
+    );
+    assert!(base.contains("model = \"model-a\""));
+    assert!(base.contains("[model_providers.custom]"));
+    let text = base
+        .replace(
+            "approval_policy = \"on-request\"",
+            "approval_policy = \"never\"",
+        )
+        .replace("model = \"model-a\"", "model = \"model-b\"");
+    let preview = gui.ok(
+        "gui/config/provider/preview",
+        with(&params, json!({"editorBase":base,"editedText":text})),
+    );
+    assert_eq!(preview["model"], "model-b");
+    assert_eq!(preview["globalChanges"], json!(["approval_policy"]));
+    let row = preview["text"].as_str().unwrap();
+    assert!(!row.contains("approval_policy") && !row.contains("model_reasoning_summary"));
+    // MyCodex options change a setting the editor left alone while it is open.
+    rewrite_config(
+        &gui,
+        "model_reasoning_summary = \"auto\"",
+        "model_reasoning_summary = \"detailed\"",
+    );
+    let saved = gui.ok(
+        "gui/provider/save",
+        with(
+            &params,
+            json!({"configToml":preview["text"],"model":"model-b","editor":{"base":base,"text":text}}),
+        ),
+    );
+    assert!(saved.get("editorConflict").is_none(), "{saved}");
+    assert_eq!(saved["globalApplied"], true);
+    let config = gui.config();
+    assert!(
+        config.contains("model_reasoning_summary = \"detailed\""),
+        "{config}"
+    );
+    assert!(config.contains("approval_policy = \"never\""));
+    assert!(config.contains("sandbox_mode = \"read-only\""));
+    assert!(config.contains("model = \"model-b\""));
+
+    // The same key changed in the editor and outside it: nothing is written until the user chooses.
+    let params = with(
+        &params,
+        json!({"expectedVersion":saved["version"],"model":"model-b","configToml":preview["text"]}),
+    );
+    let base = gui.ok("gui/config/provider/view", params.clone())["text"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let text = base
+        .replace(
+            "sandbox_mode = \"read-only\"",
+            "sandbox_mode = \"workspace-write\"",
+        )
+        .replace(
+            "approval_policy = \"never\"",
+            "approval_policy = \"untrusted\"",
+        );
+    rewrite_config(
+        &gui,
+        "sandbox_mode = \"read-only\"",
+        "sandbox_mode = \"danger-full-access\"",
+    );
+    let before = gui.config();
+    let editor = |policy: &str| {
+        with(
+            &params,
+            json!({"editor":{"base":base,"text":text,"onConflict":policy}}),
+        )
+    };
+    let refused = gui.ok("gui/provider/save", editor("refuse"));
+    assert_eq!(refused["editorConflict"]["keys"], json!(["sandbox_mode"]));
+    assert_eq!(gui.config(), before, "a refused conflict writes nothing");
+    let theirs = gui.ok("gui/provider/save", editor("keepTheirs"));
+    assert!(theirs.get("editorConflict").is_none(), "{theirs}");
+    let config = gui.config();
+    assert!(
+        config.contains("sandbox_mode = \"danger-full-access\""),
+        "{config}"
+    );
+    assert!(config.contains("approval_policy = \"untrusted\""));
+    let params = with(&params, json!({"expectedVersion":theirs["version"]}));
+    let mine = gui.ok(
+        "gui/provider/save",
+        with(
+            &params,
+            json!({"editor":{"base":base,"text":text,"onConflict":"keepMine"}}),
+        ),
+    );
+    assert!(mine.get("editorConflict").is_none(), "{mine}");
+    assert!(gui.config().contains("sandbox_mode = \"workspace-write\""));
+
+    // A form-only save never carries global edits.
+    let params = with(
+        &params,
+        json!({"expectedVersion":mine["version"],"name":"renamed"}),
+    );
+    rewrite_config(
+        &gui,
+        "approval_policy = \"untrusted\"",
+        "approval_policy = \"on-failure\"",
+    );
+    let renamed = gui.ok("gui/provider/save", params);
+    assert!(renamed.get("editorConflict").is_none());
+    assert!(gui.config().contains("approval_policy = \"on-failure\""));
+}
+
+#[test]
+fn full_config_editor_keeps_routes_and_inactive_additions_off_live() {
+    let mut gui = Gui::new();
+    gui.start();
+    let mut routed = save("routed");
+    routed["kind"] = json!("chat_completions");
+    let saved = gui.ok("gui/provider/save", routed.clone());
+    let routed = with(&routed, json!({"expectedVersion":saved["version"]}));
+    assert!(gui.config().contains("127.0.0.1"));
+    let path = gui.root.path().join("codex/config.toml");
+    std::fs::write(
+        &path,
+        format!("approval_policy = \"on-request\"\n{}", gui.config()),
+    )
+    .unwrap();
+    let base = gui.ok("gui/config/provider/view", routed.clone())["text"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let text = base.replace(
+        "approval_policy = \"on-request\"",
+        "approval_policy = \"never\"",
+    );
+    let saved = gui.ok(
+        "gui/provider/save",
+        with(&routed, json!({"editor":{"base":base,"text":text}})),
+    );
+    assert!(saved.get("editorConflict").is_none(), "{saved}");
+    let config = gui.config();
+    assert!(config.contains("approval_policy = \"never\""), "{config}");
+    assert!(
+        config.contains("127.0.0.1"),
+        "the route stays in place: {config}"
+    );
+    assert_eq!(
+        gui.ok("status", json!({}))["route"]["running"],
+        true,
+        "editing the routed provider keeps routing"
+    );
+
+    // A new provider that does not become current only contributes global edits.
+    let added = save("added");
+    let base = gui.ok("gui/config/provider/view", added.clone())["text"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let text = base.replace(
+        "approval_policy = \"never\"",
+        "approval_policy = \"untrusted\"",
+    );
+    let saved = gui.ok(
+        "gui/provider/save",
+        with(&added, json!({"editor":{"base":base,"text":text}})),
+    );
+    assert!(saved.get("editorConflict").is_none(), "{saved}");
+    let config = gui.config();
+    assert!(
+        config.contains("approval_policy = \"untrusted\""),
+        "{config}"
+    );
+    assert!(
+        config.contains("127.0.0.1"),
+        "adding does not switch: {config}"
+    );
+    assert_eq!(
+        gui.ok("gui/provider/list", json!({}))["currentProviderId"],
+        "routed"
     );
 }
 

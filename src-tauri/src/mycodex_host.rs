@@ -210,6 +210,7 @@ fn handle(host: &Host, request: &Request) -> Result<Value> {
                 "codexConversionLifecycle",
                 "contextSettings",
                 "configEditing",
+                "fullConfigEditor",
                 "guiProviderManagement",
                 "guiMcpManagement",
                 "globalAuthCapture",

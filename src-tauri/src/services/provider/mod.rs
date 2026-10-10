@@ -3,13 +3,16 @@
 //! Handles provider CRUD operations, switching, and configuration management.
 
 pub(crate) mod claude_direct;
-mod claude_editor;
+// MyCodex: the headless host reuses the editor's split save and three-way merge.
+pub(crate) mod claude_editor;
 pub(crate) mod codex_client_catalog;
 pub(crate) mod codex_direct;
-mod codex_editor;
+// MyCodex: the headless host reuses the editor's split save and three-way merge.
+pub(crate) mod codex_editor;
 mod codex_login;
 pub(crate) mod codex_official_models;
-mod editor_toml;
+// MyCodex: the headless host reuses the editor's split save and three-way merge.
+pub(crate) mod editor_toml;
 mod endpoints;
 mod gemini_auth;
 pub(crate) mod gemini_direct;
