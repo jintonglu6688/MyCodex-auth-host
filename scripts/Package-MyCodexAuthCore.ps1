@@ -8,7 +8,7 @@ param(
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 $manifestName = 'mycodex-auth-host.manifest.json'
-$upstream = 'e0f70019b2758f5b6b9a04dd60e4689481a0c0ac'
+$upstream = '2db86e94da13365caae55bb08d09295e31500d21'
 
 function Assert-Identity($Identity) {
     if ($Identity.protocolVersion -ne 3 -or $Identity.hostVersion -cne '0.3.0' -or

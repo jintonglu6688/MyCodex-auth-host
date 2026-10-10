@@ -16,7 +16,7 @@ TARGETS = (
     "aarch64-unknown-linux-gnu",
     "aarch64-apple-darwin",
 )
-UPSTREAM = "e0f70019b2758f5b6b9a04dd60e4689481a0c0ac"
+UPSTREAM = "2db86e94da13365caae55bb08d09295e31500d21"
 
 
 def require(condition, message):

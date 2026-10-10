@@ -26,7 +26,7 @@ mod security;
 
 type Result<T> = std::result::Result<T, &'static str>;
 const MAX_REQUEST: usize = 1_048_576;
-const UPSTREAM: &str = "e0f70019b2758f5b6b9a04dd60e4689481a0c0ac";
+const UPSTREAM: &str = "2db86e94da13365caae55bb08d09295e31500d21";
 
 pub(crate) struct RuntimePaths {
     pub data_dir: PathBuf,

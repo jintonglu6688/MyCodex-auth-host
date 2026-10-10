@@ -13,7 +13,7 @@ import tempfile
 
 NAME = "mycodex-auth-host"
 MANIFEST = NAME + ".manifest.json"
-UPSTREAM = "e0f70019b2758f5b6b9a04dd60e4689481a0c0ac"
+UPSTREAM = "2db86e94da13365caae55bb08d09295e31500d21"
 FIELDS = ("hostVersion", "protocolVersion", "upstreamRevision", "sourceRevision",
           "sourceDirty", "target", "sha256")
 

@@ -342,7 +342,7 @@ fn build_identity_is_independent_of_runtime_checkout_and_matches_resident() {
     assert_eq!(identity["target"], env!("MYCODEX_CORE_TARGET"));
     assert_eq!(
         identity["upstreamRevision"],
-        "e0f70019b2758f5b6b9a04dd60e4689481a0c0ac"
+        "2db86e94da13365caae55bb08d09295e31500d21"
     );
     for dir in [&p.unrelated, &p.data, &p.codex] {
         assert_eq!(fs::read_dir(dir).unwrap().count(), 0);
