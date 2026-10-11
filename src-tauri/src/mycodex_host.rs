@@ -24,6 +24,9 @@ mod paths;
 mod runtime_config;
 mod security;
 mod session_choices;
+mod session_history;
+mod session_ledger;
+mod session_repair;
 mod shadowed_settings;
 
 type Result<T> = std::result::Result<T, &'static str>;
@@ -199,6 +202,7 @@ fn handle(host: &Host, request: &Request) -> Result<Value> {
             | "gui/mcp/import"
             | "gui/mcp/save"
             | "gui/mcp/delete"
+            | "gui/sessionHistory/set"
     ) {
         lifecycle::pause_if_external();
     }
@@ -217,6 +221,8 @@ fn handle(host: &Host, request: &Request) -> Result<Value> {
                 "guiMcpManagement",
                 "globalAuthCapture",
                 "runtimeConfigPreparation",
+                "unifiedSessionHistory",
+                "sessionHistoryRepair",
             ]);
             value["route"] = lifecycle::status(state)?;
             Ok(value)

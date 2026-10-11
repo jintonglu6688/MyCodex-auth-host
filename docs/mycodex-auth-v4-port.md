@@ -224,6 +224,22 @@ Mac SSH 目标验收时“更新后台”失败，界面只显示通用失败。
 - 修复：`session_choices::backfill` 在 `lifecycle::activate` 切换前，若 live 属于当前供应商（直连按身份、路由按本宿主令牌），把 `model`、`model_reasoning_effort`、`plan_mode_reasoning_effort`、`review_model` 存回当前供应商的行（缺失的推理字段视为恢复默认）。保存当前供应商并因转换需求变化而重新激活时用 `activate_saved`，不回填，以表单为准。表单快照与回填共用同一套覆盖规则，路由中的当前供应商也显示 live 的选择。
 - 回归测试：`session_model_choices_are_kept_per_provider_across_switches`、`chatgpt_session_model_choice_returns_after_switching_away`（去掉回填时都失败）。
 
+## 后续：统一 Codex 会话历史（未发布）
+
+- 问题：Codex 恢复会话时沿用会话里记录的 provider（`thread/resume` 未指定 model/provider 时套用持久化的值）。先用中转（`custom`）再切到 ChatGPT 账号，继续旧会话时：0.2.x 删除了 `custom` 表，报 `Model provider 'custom' not found`；v4 留下指向本地代理的休眠表，配置能加载，但直连模式下代理不接受请求，一直显示 `Reconnecting... waiting for network`。
+- 做法：接入上游「统一 Codex 会话历史」（`unify_codex_session_history`）。开启后官方账号以 `custom` 运行（官方镜像表，认证仍走 ChatGPT 登录），会话跟随当前启用的供应商。设置保存在 `--data-dir` 的 `settings.json`，按执行目标独立；默认关闭。
+- 宿主接口（能力 `unifiedSessionHistory`）：`gui/sessionHistory/get` 返回 `unified`、`pending`、`repairOnResume`；`gui/sessionHistory/preview` 返回 `toMigrate`（开启时会迁移的官方会话数）和 `toRestore`（关闭时会还原的会话数）；`gui/sessionHistory/set` 只接受 `unified`。切换开关时只重写当前官方供应商的 live（`lifecycle::reapply_official`，先回填会话选择），失败则回滚设置。之后固定迁移或还原，结果在 `moved {sessions, indexRows}`；失败不回滚开关，返回 `moved.error: history_move_failed`，`pending` 为真，用同一个值再调用一次即重试。live 不是 `custom` 时开启不迁移，按失败处理，以免会话移到当前配置看不到的分组。不在宿主启动时自动重试：迁移只在前端的运行时过渡锁内执行，期间没有对话写会话文件，完成后前端重启 App Server。
+- 迁移不做整份备份（`session_ledger`）。上游每次迁移都复制全部会话文件和状态库，开关反复切换会占用数百 MB；而且还原时用旧备份覆盖，会丢掉开启期间新增的回合。现在只改每个会话首行 `session_meta.payload.model_provider`（`openai` → `custom`，`.jsonl.zst` 同样支持，写前确认文件未变）和状态库 `threads.model_provider`。迁移前先把会话 id 记入私有目录的 `codex-session-history-ledger.json`（按规范化的 Codex 目录分组，只增不删），还原时只把账本里、当前仍是 `custom` 的会话改回 `openai`。开启期间新建的会话不在账本里，关闭后保持 `custom`。
+- MyCodex 的官方账号始终直连（`conversion` 返回 false），不会用到代理下的官方镜像表 `OfficialProxy { unified: true }`，所以不需要给它补路由凭据。
+- 自动捕获：官方镜像表没有 `base_url`。`auto_capture::identity` 把“没有 `base_url` 且 `requires_openai_auth = true`”的表按 Codex 的实际行为视为官方地址，否则开启后列表会报 `unsupported_auth_source`。
+- 上游补丁：`codex_history_migration.rs` 只把 `lock_codex_official_history_op` 改为 `pub(crate)`，账本迁移和会话修复与上游迁移共用这把锁。上游的整份备份迁移和 `unify_codex_migrate_existing` 不再使用。
+- 跨供应商续聊的会话修复（能力 `sessionHistoryRepair`，`gui/sessionHistory/repair {threadId, mode}`）：统一后，别家回合留下的状态会原样发给官方而被拒，例如推理条目带思考原文（DeepSeek：`array_above_max_length`）、推理密文不是官方签发的、条目 id 前缀不对、CC Switch 包装的压缩摘要。官方保持直连，不走代理清理，改为由前端在线程未加载时修复会话文件：
+  - `resume`：开关开启且当前是官方时，在 `thread/resume` 之前执行。只去掉官方一定拒的内容：推理只保留 `gAAAAA` 开头且没有原文的，去掉前缀不对的 id，CC Switch 压缩摘要转成文字。纯官方会话一字节不变。`get` 的 `repairOnResume` 供前端判断是否需要调用。
+  - `rejected`：任何供应商按上游整流器的特征拒绝后执行。规则与 `rectify_opaque_state` 相同：去掉全部推理条目，加密片段换成占位文字，去掉不合格的 id；末尾那条 `agent_message`（子 agent 的当前任务）保留。
+  - `compaction`：用户确认后执行，把别家签发的压缩条目换成说明文字。这会丢失早期上下文。
+  - 按 `rollout-*-<threadId>.jsonl[.zst]` 只在 `sessions/`、`archived_sessions/` 下查找。与历史迁移共用一把锁；写回前后各确认文件未变（变了返回 `session_changed`）。原文件备份到私有目录 `backups/codex-session-repair-v1/<时间>/`，保留最近 50 份。
+- 回归测试：`unified_session_history_resumes_relay_sessions_with_the_chatgpt_account`、`unified_session_history_changes_no_live_file_while_a_relay_is_in_use`、`unified_session_history_moves_official_sessions_both_ways_without_copying_them`、`session_repair_cleans_another_providers_turns_before_the_chatgpt_account_resumes_them`，以及 `mycodex_host::session_repair`、`mycodex_host::session_ledger` 的单元测试。
+
 ## 主要风险
 
 | 风险 | 应对 |

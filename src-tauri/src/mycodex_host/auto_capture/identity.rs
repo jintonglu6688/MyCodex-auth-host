@@ -45,7 +45,13 @@ pub(super) fn identify(live: &Value) -> Result<Option<Identity>> {
             }
         })
         .unwrap_or_else(|| {
-            if source == "openai" {
+            // A table without base_url that uses the OpenAI login reaches the
+            // official backend, like the unified session history mirror.
+            let official_login = selected
+                .and_then(|p| p.get("requires_openai_auth"))
+                .and_then(toml::Value::as_bool)
+                == Some(true);
+            if source == "openai" || official_login {
                 "https://api.openai.com/v1".into()
             } else {
                 String::new()

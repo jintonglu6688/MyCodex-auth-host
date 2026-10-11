@@ -147,6 +147,9 @@ pub(super) fn handle(host: &Host, method: &str, params: &Value) -> Result<Value>
         "gui/preset/list" => gui_catalog::presets(),
         "gui/model/fetch" => gui_catalog::fetch_models(state, params),
         method if method.starts_with("gui/mcp/") => super::gui_mcp::handle(host, method, params),
+        method if method.starts_with("gui/sessionHistory/") => {
+            super::session_history::handle(host, method, params)
+        }
         "gui/provider/list" => {
             let captured = auto_capture::read(state)?;
             let current = captured.current;

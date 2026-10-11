@@ -361,6 +361,26 @@ fn switch_to(state: &AppState, provider: &Provider) -> Result<()> {
     result
 }
 
+/// Rewrite the live route of an official provider in use, whose route depends on
+/// the unified session history setting. Third-party routes do not depend on it.
+pub(super) fn reapply_official(state: &AppState) -> Result<bool> {
+    let Some(provider) = official_in_use(state)? else {
+        return Ok(false);
+    };
+    activate(state, &provider)?;
+    Ok(true)
+}
+
+/// The Codex provider in use when it is an official (ChatGPT) one.
+pub(super) fn official_in_use(state: &AppState) -> Result<Option<Provider>> {
+    let current = ProviderService::current(state, AppType::Codex).map_err(service_error)?;
+    let provider = state
+        .db
+        .get_provider_by_id(&current, "codex")
+        .map_err(service_error)?;
+    Ok(provider.filter(crate::services::provider::codex_direct::is_official))
+}
+
 /// After an edit, keep the mode consistent with the provider now in use.
 pub(super) fn reconcile(state: &AppState) -> Result<()> {
     let current = ProviderService::current(state, AppType::Codex).map_err(service_error)?;

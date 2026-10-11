@@ -1625,3 +1625,379 @@ fn capture_diagnostics_record_decisions_and_partial_failure_without_private_data
     assert_eq!(result["liveState"], "current");
     assert_eq!(result["providers"].as_array().unwrap().len(), 3);
 }
+
+fn session_fixture(gui: &Gui, id: &str, provider: &str) -> std::path::PathBuf {
+    let dir = gui.root.path().join("codex/sessions/2026/10/10");
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join(format!("rollout-2026-10-10T00-00-00-{id}.jsonl"));
+    let meta = json!({"type":"session_meta","payload":{"id":id,"model_provider":provider}});
+    let turn = json!({"type":"response_item","payload":{"type":"message","content":"kept"}});
+    std::fs::write(&path, format!("{meta}\n{turn}\n")).unwrap();
+    path
+}
+
+fn session_provider(path: &std::path::Path) -> String {
+    let text = std::fs::read_to_string(path).unwrap();
+    let meta: Value = serde_json::from_str(text.lines().next().unwrap()).unwrap();
+    meta["payload"]["model_provider"]
+        .as_str()
+        .unwrap()
+        .to_string()
+}
+
+fn thread_providers(gui: &Gui) -> Vec<(String, String)> {
+    let conn = rusqlite::Connection::open(gui.root.path().join("codex/state_5.sqlite")).unwrap();
+    let mut statement = conn
+        .prepare("SELECT id, model_provider FROM threads ORDER BY id")
+        .unwrap();
+    let rows = statement
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+        .unwrap();
+    rows.map(Result::unwrap).collect()
+}
+
+#[test]
+fn unified_session_history_resumes_relay_sessions_with_the_chatgpt_account() {
+    let mut gui = Gui::new();
+    external_account(&gui, "alice", "team-workspace", "model-a");
+    gui.start();
+    let account = gui.ok("gui/provider/list", json!({}))["currentProviderId"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    gui.ok("gui/provider/save", save("api"));
+    assert!(gui.ok("status", json!({}))["capabilities"]
+        .as_array()
+        .unwrap()
+        .contains(&json!("unifiedSessionHistory")));
+    let initial = gui.ok("gui/sessionHistory/get", json!({}));
+    assert_eq!(initial["unified"], false, "{initial}");
+    assert_eq!(initial["pending"], false, "{initial}");
+
+    let enabled = gui.ok("gui/sessionHistory/set", json!({"unified":true}));
+    assert_eq!(enabled["unified"], true, "{enabled}");
+    assert_eq!(enabled["globalApplied"], true, "{enabled}");
+    assert_eq!(enabled["moved"]["sessions"], 0, "{enabled}");
+    let auth = std::fs::read(gui.root.path().join("codex/auth.json")).unwrap();
+    // The account now runs under the shared id, still with its own login.
+    let config: toml::Value = gui.config().parse().unwrap();
+    assert_eq!(
+        config["model_provider"].as_str(),
+        Some("custom"),
+        "{config}"
+    );
+    let mirror = &config["model_providers"]["custom"];
+    assert_eq!(
+        mirror["requires_openai_auth"].as_bool(),
+        Some(true),
+        "{config}"
+    );
+    assert!(mirror.get("base_url").is_none(), "{config}");
+    assert!(
+        mirror.get("experimental_bearer_token").is_none(),
+        "{config}"
+    );
+    let list = gui.ok("gui/provider/list", json!({}));
+    assert_eq!(list["currentProviderId"], account.as_str(), "{list}");
+    assert_eq!(list["providers"].as_array().unwrap().len(), 2, "{list}");
+
+    // Relay and account keep the same session id across switches.
+    switch_gui(&gui, "api", "to-api");
+    let config: toml::Value = gui.config().parse().unwrap();
+    assert_eq!(config["model_provider"].as_str(), Some("custom"));
+    assert_eq!(
+        config["model_providers"]["custom"]["base_url"].as_str(),
+        Some("https://example.invalid/v1")
+    );
+    switch_gui(&gui, &account, "to-account");
+    let config: toml::Value = gui.config().parse().unwrap();
+    assert_eq!(
+        config["model_provider"].as_str(),
+        Some("custom"),
+        "{config}"
+    );
+    assert!(config["model_providers"]["custom"]
+        .get("base_url")
+        .is_none());
+    assert_eq!(
+        std::fs::read(gui.root.path().join("codex/auth.json")).unwrap(),
+        auth
+    );
+    // The shared id lives only in the live file, never in the account's saved row.
+    let row: String = rusqlite::Connection::open(gui.root.path().join("store/cc-switch.db"))
+        .unwrap()
+        .query_row(
+            "SELECT settings_config FROM providers WHERE id = ?1 AND app_type = 'codex'",
+            [&account],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(!row.contains("requires_openai_auth"), "{row}");
+    let list = gui.ok("gui/provider/list", json!({}));
+    assert_eq!(list["currentProviderId"], account.as_str(), "{list}");
+    assert_eq!(list["providers"].as_array().unwrap().len(), 2, "{list}");
+
+    // A restart keeps the setting.
+    gui.stop();
+    gui.start();
+    assert_eq!(gui.ok("gui/sessionHistory/get", json!({}))["unified"], true);
+
+    let disabled = gui.ok("gui/sessionHistory/set", json!({"unified":false}));
+    assert_eq!(disabled["unified"], false, "{disabled}");
+    assert_eq!(disabled["globalApplied"], true, "{disabled}");
+    let config: toml::Value = gui.config().parse().unwrap();
+    assert!(config.get("model_provider").is_none(), "{config}");
+    assert_eq!(
+        gui.ok("gui/provider/list", json!({}))["currentProviderId"],
+        account.as_str()
+    );
+}
+
+#[test]
+fn unified_session_history_changes_no_live_file_while_a_relay_is_in_use() {
+    let mut gui = Gui::new();
+    external_account(&gui, "alice", "team-workspace", "model-a");
+    gui.start();
+    gui.ok("gui/provider/save", save("api"));
+    switch_gui(&gui, "api", "to-api");
+    let before = gui.config();
+    let enabled = gui.ok("gui/sessionHistory/set", json!({"unified":true}));
+    assert_eq!(enabled["globalApplied"], false, "{enabled}");
+    assert_eq!(gui.config(), before);
+    assert!(enabled["moved"]["error"].is_null(), "{enabled}");
+    assert_eq!(
+        gui.call("gui/sessionHistory/set", json!({"unified":"yes"}))["error"]["message"],
+        "invalid_params"
+    );
+}
+
+#[test]
+fn unified_session_history_moves_official_sessions_both_ways_without_copying_them() {
+    let mut gui = Gui::new();
+    external_account(&gui, "alice", "team-workspace", "model-a");
+    let official = session_fixture(&gui, "11111111-1111-4111-8111-111111111111", "openai");
+    let relay = session_fixture(&gui, "22222222-2222-4222-8222-222222222222", "custom");
+    let other = session_fixture(&gui, "33333333-3333-4333-8333-333333333333", "my-relay");
+    let relay_before = std::fs::read(&relay).unwrap();
+    {
+        let conn =
+            rusqlite::Connection::open(gui.root.path().join("codex/state_5.sqlite")).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE threads (id TEXT PRIMARY KEY, model_provider TEXT NOT NULL);
+             INSERT INTO threads VALUES ('11111111-1111-4111-8111-111111111111','openai'),
+                ('22222222-2222-4222-8222-222222222222','custom'),
+                ('33333333-3333-4333-8333-333333333333','my-relay');",
+        )
+        .unwrap();
+    }
+    gui.start();
+    let preview = gui.ok("gui/sessionHistory/preview", json!({}));
+    assert_eq!(preview["toMigrate"], 1, "{preview}");
+    assert_eq!(preview["toRestore"], 0, "{preview}");
+
+    // Turning it on moves the earlier official sessions without being asked.
+    let enabled = gui.ok("gui/sessionHistory/set", json!({"unified":true}));
+    assert_eq!(enabled["moved"]["sessions"], 1, "{enabled}");
+    assert_eq!(enabled["moved"]["indexRows"], 1, "{enabled}");
+    assert!(enabled["moved"]["error"].is_null(), "{enabled}");
+    assert_eq!(enabled["pending"], false, "{enabled}");
+    assert_eq!(session_provider(&official), "custom");
+    assert!(std::fs::read_to_string(&official).unwrap().contains("kept"));
+    assert_eq!(std::fs::read(&relay).unwrap(), relay_before);
+    assert_eq!(session_provider(&other), "my-relay");
+    assert_eq!(
+        thread_providers(&gui),
+        vec![
+            (
+                "11111111-1111-4111-8111-111111111111".into(),
+                "custom".into()
+            ),
+            (
+                "22222222-2222-4222-8222-222222222222".into(),
+                "custom".into()
+            ),
+            (
+                "33333333-3333-4333-8333-333333333333".into(),
+                "my-relay".into()
+            ),
+        ]
+    );
+    // Only the ids that were official are kept, in the private store.
+    let store = gui.root.path().join("store");
+    let ledger = std::fs::read_to_string(store.join("codex-session-history-ledger.json")).unwrap();
+    assert!(
+        ledger.contains("11111111-1111-4111-8111-111111111111"),
+        "{ledger}"
+    );
+    assert!(!ledger.contains("22222222"), "{ledger}");
+    assert!(!store
+        .join("backups/codex-official-history-unify-v1")
+        .exists());
+    assert_eq!(
+        gui.ok("gui/sessionHistory/set", json!({"unified":true}))["moved"]["sessions"],
+        0
+    );
+
+    // A turn added while unified survives the move back.
+    let mut text = std::fs::read_to_string(&official).unwrap();
+    text.push_str(&format!(
+        "{}\n",
+        json!({"type":"response_item","payload":{"type":"message","content":"later turn"}})
+    ));
+    std::fs::write(&official, text).unwrap();
+    let preview = gui.ok("gui/sessionHistory/preview", json!({}));
+    assert_eq!(preview["toMigrate"], 0, "{preview}");
+    assert_eq!(preview["toRestore"], 1, "{preview}");
+
+    let disabled = gui.ok("gui/sessionHistory/set", json!({"unified":false}));
+    assert_eq!(disabled["moved"]["sessions"], 1, "{disabled}");
+    assert_eq!(disabled["moved"]["indexRows"], 1, "{disabled}");
+    assert_eq!(disabled["pending"], false, "{disabled}");
+    assert_eq!(session_provider(&official), "openai");
+    let restored = std::fs::read_to_string(&official).unwrap();
+    assert!(restored.contains("kept") && restored.contains("later turn"));
+    assert_eq!(std::fs::read(&relay).unwrap(), relay_before);
+    assert_eq!(
+        thread_providers(&gui)[0],
+        (
+            "11111111-1111-4111-8111-111111111111".into(),
+            "openai".into()
+        )
+    );
+
+    // Going round again moves the same sessions and still copies nothing.
+    let enabled = gui.ok("gui/sessionHistory/set", json!({"unified":true}));
+    assert_eq!(enabled["moved"]["sessions"], 1, "{enabled}");
+    let disabled = gui.ok("gui/sessionHistory/set", json!({"unified":false}));
+    assert_eq!(disabled["moved"]["sessions"], 1, "{disabled}");
+    assert_eq!(session_provider(&official), "openai");
+    assert!(!store
+        .join("backups/codex-official-history-unify-v1")
+        .exists());
+    assert!(!store
+        .join("backups/codex-official-history-unify-restore-v1")
+        .exists());
+    assert_eq!(
+        gui.ok("gui/sessionHistory/get", json!({}))["pending"],
+        false
+    );
+}
+
+fn mixed_session(gui: &Gui, id: &str) -> std::path::PathBuf {
+    let dir = gui.root.path().join("codex/sessions/2026/10/10");
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join(format!("rollout-2026-10-10T22-34-05-{id}.jsonl"));
+    let lines = [
+        json!({"type":"session_meta","payload":{"id":id,"model_provider":"custom"}}),
+        json!({"type":"response_item","payload":{"type":"reasoning","id":"601f9c7c","summary":[],
+            "content":[{"type":"reasoning_text","text":"plan"}],"encrypted_content":"9716bfa2-0"}}),
+        json!({"type":"response_item","payload":{"type":"message","id":"09c974db","role":"assistant",
+            "content":[{"type":"output_text","text":"kept"}]}}),
+        json!({"type":"response_item","payload":{"type":"reasoning","id":"rs_1","summary":[],
+            "encrypted_content":"gAAAAABqofficial"}}),
+    ];
+    let text: String = lines.iter().map(|line| format!("{line}\n")).collect();
+    std::fs::write(&path, text).unwrap();
+    path
+}
+
+#[test]
+fn session_repair_cleans_another_providers_turns_before_the_chatgpt_account_resumes_them() {
+    let mut gui = Gui::new();
+    external_account(&gui, "alice", "team-workspace", "model-a");
+    let id = "01a1263c-44bd-7800-8000-000000000001";
+    let session = mixed_session(&gui, id);
+    let original = std::fs::read(&session).unwrap();
+    gui.start();
+    assert!(gui.ok("status", json!({}))["capabilities"]
+        .as_array()
+        .unwrap()
+        .contains(&json!("sessionHistoryRepair")));
+    let resume = json!({"threadId":id,"mode":"resume"});
+    assert_eq!(
+        gui.ok("gui/sessionHistory/get", json!({}))["repairOnResume"],
+        false
+    );
+    // Separate histories never mix providers, so nothing is touched.
+    assert_eq!(
+        gui.ok("gui/sessionHistory/repair", resume.clone())["skipped"],
+        "not_unified"
+    );
+    assert_eq!(std::fs::read(&session).unwrap(), original);
+
+    gui.ok("gui/sessionHistory/set", json!({"unified":true}));
+    assert_eq!(
+        gui.ok("gui/sessionHistory/get", json!({}))["repairOnResume"],
+        true
+    );
+    let repaired = gui.ok("gui/sessionHistory/repair", resume.clone());
+    assert_eq!(repaired["repaired"], true, "{repaired}");
+    assert_eq!(repaired["reasoning"], 1, "{repaired}");
+    assert_eq!(repaired["ids"], 1, "{repaired}");
+    let text = std::fs::read_to_string(&session).unwrap();
+    assert!(
+        !text.contains("reasoning_text") && !text.contains("09c974db"),
+        "{text}"
+    );
+    assert!(
+        text.contains("kept") && text.contains("gAAAAABqofficial"),
+        "{text}"
+    );
+    // The original stays in the private store, away from Codex's session list.
+    let generations: Vec<_> = std::fs::read_dir(
+        gui.root
+            .path()
+            .join("store/backups/codex-session-repair-v1"),
+    )
+    .unwrap()
+    .map(|entry| entry.unwrap().path())
+    .collect();
+    assert_eq!(generations.len(), 1);
+    assert_eq!(
+        std::fs::read(generations[0].join(session.file_name().unwrap())).unwrap(),
+        original
+    );
+    assert_eq!(
+        gui.ok("gui/sessionHistory/repair", resume.clone())["skipped"],
+        "nothing_to_repair"
+    );
+
+    // After a refusal every reasoning item goes, whoever issued it.
+    let rejected = gui.ok(
+        "gui/sessionHistory/repair",
+        json!({"threadId":id,"mode":"rejected"}),
+    );
+    assert_eq!(rejected["reasoning"], 1, "{rejected}");
+    assert!(!std::fs::read_to_string(&session)
+        .unwrap()
+        .contains("gAAAAABqofficial"));
+    assert_eq!(
+        gui.ok(
+            "gui/sessionHistory/repair",
+            json!({"threadId":"01a1263c-0000-7000-8000-000000000009","mode":"rejected"})
+        )["skipped"],
+        "not_found"
+    );
+    for params in [
+        json!({"threadId":"../../auth","mode":"rejected"}),
+        json!({"threadId":id,"mode":"everything"}),
+        json!({"mode":"resume"}),
+    ] {
+        assert_eq!(
+            gui.call("gui/sessionHistory/repair", params)["error"]["message"],
+            "invalid_params"
+        );
+    }
+
+    // A relay in use reads its own history; resuming leaves it alone.
+    gui.ok("gui/provider/save", save("api"));
+    switch_gui(&gui, "api", "repair-relay");
+    assert_eq!(
+        gui.ok("gui/sessionHistory/get", json!({}))["repairOnResume"],
+        false
+    );
+    assert_eq!(
+        gui.ok("gui/sessionHistory/repair", resume)["skipped"],
+        "not_official"
+    );
+}
