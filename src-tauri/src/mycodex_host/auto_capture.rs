@@ -46,6 +46,51 @@ pub(super) fn before_write(state: &AppState) -> Result<()> {
     Ok(())
 }
 
+// Only a missing external environment reference can be replaced explicitly.
+// Invalid files, account ownership, profiles and store errors remain blocking.
+pub(super) fn before_write_or_credential_recovery(state: &AppState) -> Result<bool> {
+    match before_write(state) {
+        Ok(()) => Ok(false),
+        Err("credential_reference_unavailable") => Ok(true),
+        Err(error) => Err(error),
+    }
+}
+
+pub(super) fn backup_for_credential_recovery(fingerprint: &str) -> Result<()> {
+    for path in [codex::get_codex_config_path(), codex::get_codex_auth_path()] {
+        match std::fs::symlink_metadata(&path) {
+            Ok(metadata) => {
+                if !metadata.is_file() || metadata.file_type().is_symlink() {
+                    return Err("invalid_live_config");
+                }
+                #[cfg(windows)]
+                {
+                    use std::os::windows::fs::MetadataExt;
+                    if metadata.file_attributes() & 0x400 != 0 {
+                        return Err("invalid_live_config");
+                    }
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => (),
+            Err(_) => return Err("invalid_live_config"),
+        }
+    }
+    let snapshot = Snapshot::read()?;
+    let backup = json!({
+        "config":snapshot.config.as_deref().map(String::from_utf8_lossy),
+        "auth":snapshot.auth.as_deref().map(String::from_utf8_lossy),
+    });
+    let path = super::runtime_paths()
+        .ok_or("runtime_not_initialized")?
+        .data_dir
+        .join(format!("credentials-before-recovery-{fingerprint}.json"));
+    let bytes = serde_json::to_vec(&backup).map_err(|_| "config_backup_failed")?;
+    crate::config::stage_write(&path, &bytes, Some(0o600), true)
+        .and_then(|file| file.commit())
+        .map_err(|_| "config_backup_failed")?;
+    snapshot.unchanged()
+}
+
 // The caller owns lifecycle::mutation. Recoverable live errors leave the archive readable.
 fn reconcile(state: &AppState, source: &'static str) -> Result<Outcome> {
     let mut trace = diagnostics::Trace::new(source);

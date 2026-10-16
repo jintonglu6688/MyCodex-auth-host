@@ -11,7 +11,7 @@ $manifestName = 'mycodex-auth-host.manifest.json'
 $upstream = '790ed8009df809bedaf6c31b5ced05da46bb1f1f'
 
 function Assert-Identity($Identity) {
-    if ($Identity.protocolVersion -ne 3 -or $Identity.hostVersion -cne '0.3.4' -or
+    if ($Identity.protocolVersion -ne 3 -or $Identity.hostVersion -cne '0.3.5' -or
         $Identity.upstreamRevision -cne $upstream -or
         $Identity.sourceRevision -cnotmatch '^[0-9a-f]{40}$' -or
         $Identity.sourceDirty -isnot [bool] -or

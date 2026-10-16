@@ -185,7 +185,7 @@ pub(super) fn handle(host: &Host, method: &str, params: &Value) -> Result<Value>
         }
         "gui/provider/save" => {
             let _guard = lifecycle::mutation()?;
-            auto_capture::before_write(state)?;
+            let recovery = auto_capture::before_write_or_credential_recovery(state)?;
             let id = params["id"].as_str().ok_or("invalid_params")?;
             let (previous, edited) = edit_base(host, params)?;
             let edited = form::edit(edited, params)?;
@@ -218,19 +218,34 @@ pub(super) fn handle(host: &Host, method: &str, params: &Value) -> Result<Value>
                     on_conflict,
                 )?;
                 if !plan.edits.is_empty() {
+                    if recovery {
+                        return Err("credential_recovery_confirmation_required");
+                    }
                     if let Err(keys) = super::gui_config::write_global(state, &plan.edits)? {
                         return Ok(json!({"editorConflict":{"keys":keys}}));
                     }
                     global_written = true;
                 }
             }
-            let applied = persist(host, previous.as_ref(), edited)?;
+            let applied = if recovery {
+                lifecycle::conversion(&edited)?;
+                // No first-provider activation, MCP sync, or live update while
+                // the existing identity cannot be safely captured.
+                state
+                    .db
+                    .save_provider("codex", &edited)
+                    .map_err(|_| "save_outcome_unknown")?;
+                false
+            } else {
+                persist(host, previous.as_ref(), edited)?
+            };
             let stored = form::stored(state, id).map_err(|_| "save_outcome_unknown")?;
             let edited = form::snapshot(state, &stored).map_err(|_| "save_outcome_unknown")?;
             let mut result =
                 form::summary(state, &stored, &edited).map_err(|_| "save_outcome_unknown")?;
             // Global settings changed in config.toml also need the client to reload.
             result["globalApplied"] = json!(applied || global_written);
+            result["recoveryRequired"] = json!(recovery);
             Ok(result)
         }
         "gui/provider/copy" => {
@@ -286,11 +301,11 @@ pub(super) fn handle(host: &Host, method: &str, params: &Value) -> Result<Value>
         }
         "gui/provider/preflight" => {
             let _guard = lifecycle::mutation()?;
-            auto_capture::before_write(state)?;
+            let recovery = auto_capture::before_write_or_credential_recovery(state)?;
             let (stored, edited) = selected(host, params, true)?;
             let route_required = lifecycle::conversion(&edited)?;
             Ok(
-                json!({"providerId":stored.id,"version":form::version(&stored,&edited),"fingerprint":fingerprint(host)?,"routeRequired":route_required}),
+                json!({"providerId":stored.id,"version":form::version(&stored,&edited),"fingerprint":fingerprint(host)?,"routeRequired":route_required,"recoveryRequired":recovery}),
             )
         }
         "gui/provider/apply" => {
@@ -307,10 +322,23 @@ pub(super) fn handle(host: &Host, method: &str, params: &Value) -> Result<Value>
                     return response.clone().ok_or("operation_unknown");
                 }
             }
-            auto_capture::before_write(state)?;
+            let recovery = auto_capture::before_write_or_credential_recovery(state)?;
             let (stored, mut edited) = selected(host, params, true)?;
             if params["expectedFingerprint"].as_str() != Some(fingerprint(host)?.as_str()) {
                 return Err("config_conflict");
+            }
+            if recovery {
+                if params["confirmCredentialRecovery"].as_bool() != Some(true) {
+                    return Err("credential_recovery_confirmation_required");
+                }
+                lifecycle::conversion(&edited)?;
+                let before = params["expectedFingerprint"]
+                    .as_str()
+                    .ok_or("invalid_params")?;
+                auto_capture::backup_for_credential_recovery(before)?;
+                if fingerprint(host)? != before {
+                    return Err("config_conflict");
+                }
             }
             {
                 let mut session = host.gui.lock().map_err(|_| "session_failed")?;
@@ -330,7 +358,14 @@ pub(super) fn handle(host: &Host, method: &str, params: &Value) -> Result<Value>
                 ProviderService::update(state, AppType::Codex, None, edited.clone())
                     .map_err(|_| "operation_unknown")?;
             }
-            lifecycle::activate(state, &edited).map_err(|_| "operation_unknown")?;
+            if recovery {
+                // The live identity is external and cannot be backfilled into
+                // the previously selected row or restored on proxy exit.
+                lifecycle::detach_external(state).map_err(|_| "operation_unknown")?;
+                lifecycle::activate_saved(state, &edited).map_err(|_| "operation_unknown")?;
+            } else {
+                lifecycle::activate(state, &edited).map_err(|_| "operation_unknown")?;
+            }
             let response =
                 json!({"operationId":operation,"providerId":stored.id,"status":"applied"});
             if let Some((_, receipt)) = host

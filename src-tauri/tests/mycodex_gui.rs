@@ -617,6 +617,107 @@ fn auto_capture_uses_effective_credentials_and_preserves_private_url_on_edit() {
 }
 
 #[test]
+fn missing_live_credentials_allow_save_and_confirmed_recovery_only() {
+    for previous in ["none", "direct", "proxy"] {
+        for routed in [false, true] {
+            let mut gui = Gui::new();
+            if previous == "direct" {
+                external_api(&gui, "synthetic-secret-before", "old-model");
+            }
+            gui.start();
+            if previous == "proxy" {
+                let mut input = save("previous-route");
+                input["kind"] = json!("chat_completions");
+                gui.ok("gui/provider/save", input);
+            }
+            let old_rows = gui.ok("gui/provider/list", json!({}))["providers"].clone();
+            let original = "# preserve global settings\nmodel='old-model'\nmodel_provider='external'\napproval_policy='never'\n[model_providers.external]\nbase_url='https://external.invalid/v1'\nwire_api='responses'\nenv_key='MYCODEX_SYNTHETIC_MISSING_KEY'\n[mcp_servers.local]\ncommand='synthetic-tool'\n";
+            let auth = "{\"OPENAI_API_KEY\":\"synthetic-secret-unrelated\"}";
+            std::fs::write(gui.root.path().join("codex/config.toml"), original).unwrap();
+            std::fs::write(gui.root.path().join("codex/auth.json"), auth).unwrap();
+            let mut input = save("recovery");
+            if routed {
+                input["kind"] = json!("chat_completions");
+            }
+            let view = gui.ok("gui/config/provider/view", input.clone());
+            let mut with_editor = input.clone();
+            with_editor["editor"] = json!({"base":view["text"],"text":format!("sandbox_mode='read-only'\n{}",view["text"].as_str().unwrap())});
+            assert_eq!(
+                gui.call("gui/provider/save", with_editor)["error"]["message"],
+                "credential_recovery_confirmation_required"
+            );
+            assert_eq!(gui.config(), original);
+            let saved = gui.ok("gui/provider/save", input);
+            assert_eq!(saved["globalApplied"], false);
+            assert_eq!(saved["recoveryRequired"], true);
+            assert_eq!(gui.config(), original);
+            assert_eq!(
+                std::fs::read_to_string(gui.root.path().join("codex/auth.json")).unwrap(),
+                auth
+            );
+            let plan = gui.ok(
+                "gui/provider/preflight",
+                json!({"providerId":"recovery","expectedVersion":saved["version"]}),
+            );
+            assert_eq!(plan["recoveryRequired"], true);
+            let mut apply = json!({"providerId":"recovery","expectedVersion":plan["version"],"expectedFingerprint":plan["fingerprint"],"operationId":"recover"});
+            assert_eq!(
+                gui.call("gui/provider/apply", apply.clone())["error"]["message"],
+                "credential_recovery_confirmation_required"
+            );
+            assert_eq!(gui.config(), original);
+            apply["confirmCredentialRecovery"] = json!(true);
+            std::fs::write(
+                gui.root.path().join("codex/config.toml"),
+                format!("{original}# external edit\n"),
+            )
+            .unwrap();
+            assert_eq!(
+                gui.call("gui/provider/apply", apply.clone())["error"]["message"],
+                "config_conflict"
+            );
+            std::fs::write(gui.root.path().join("codex/config.toml"), original).unwrap();
+            // A failed backup must leave the live files and existing providers untouched.
+            let backup = gui.root.path().join("store").join(format!(
+                "credentials-before-recovery-{}.json",
+                plan["fingerprint"].as_str().unwrap()
+            ));
+            std::fs::create_dir(&backup).unwrap();
+            assert_eq!(
+                gui.call("gui/provider/apply", apply.clone())["error"]["message"],
+                "config_backup_failed"
+            );
+            assert_eq!(gui.config(), original);
+            std::fs::remove_dir(&backup).unwrap();
+            let receipt = gui.ok("gui/provider/apply", apply.clone());
+            assert_eq!(receipt["status"], "applied");
+            assert_eq!(gui.ok("gui/provider/apply", apply), receipt);
+            let stored: Value = serde_json::from_slice(&std::fs::read(&backup).unwrap()).unwrap();
+            assert_eq!(stored["config"], original);
+            assert_eq!(stored["auth"], auth);
+            assert!(gui.config().contains("approval_policy='never'"));
+            assert!(gui.config().contains("synthetic-tool"));
+            let after = gui.ok("gui/provider/list", json!({}));
+            assert_eq!(after["currentProviderId"], "recovery");
+            assert_eq!(after["syncError"], Value::Null);
+            for old in old_rows.as_array().unwrap() {
+                assert!(
+                    after["providers"].as_array().unwrap().contains(old),
+                    "old archived credentials must not be overwritten"
+                );
+            }
+            gui.stop();
+            gui.start();
+            assert_eq!(
+                gui.ok("gui/provider/list", json!({}))["currentProviderId"],
+                "recovery"
+            );
+            assert!(backup.exists());
+        }
+    }
+}
+
+#[test]
 fn auto_capture_distinguishes_saved_variants_of_one_identity() {
     let mut gui = Gui::new();
     gui.start();

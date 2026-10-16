@@ -220,6 +220,7 @@ fn handle(host: &Host, request: &Request) -> Result<Value> {
                 "guiProviderManagement",
                 "guiMcpManagement",
                 "globalAuthCapture",
+                "credentialReferenceRecovery",
                 "runtimeConfigPreparation",
                 "unifiedSessionHistory",
                 "sessionHistoryRepair",
