@@ -211,7 +211,8 @@ fn capture(state: &AppState, trace: &mut diagnostics::Trace) -> Result<Outcome> 
     trace.stage = "check_route_owner";
     if lifecycle::owns_live(snapshot.live["config"].as_str().unwrap_or("")) {
         let provider = gui_provider::stored(state, &previous)?;
-        if !lifecycle::conversion(&provider)? {
+        // Aggregation routes every default; otherwise only conversion is routed.
+        if !lifecycle::conversion(&provider)? && !lifecycle::stack_active() {
             return Err("route_live_changed_externally");
         }
         trace.kind = "routed";

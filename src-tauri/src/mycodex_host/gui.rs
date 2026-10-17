@@ -99,11 +99,11 @@ fn persist(host: &Host, previous: Option<&Provider>, edited: Provider) -> Result
     let id = edited.id.clone();
     let current = ProviderService::current(state, AppType::Codex).map_err(service_error)?;
     let applied = current == id || (previous.is_none() && current.is_empty());
-    let needs_route = lifecycle::conversion(&edited)?;
+    let mode_change = lifecycle::needs_mode_change(&edited)?;
     if current.is_empty() && previous.is_none() {
         McpService::import_from_codex(state).map_err(service_error)?;
     }
-    if applied && needs_route != lifecycle::is_proxy() {
+    if applied && mode_change {
         state
             .db
             .save_provider("codex", &edited)
@@ -144,6 +144,7 @@ pub(super) fn handle(host: &Host, method: &str, params: &Value) -> Result<Value>
         method if method.starts_with("gui/config/") => {
             super::gui_config::handle(host, method, params)
         }
+        method if method.starts_with("gui/stack/") => super::stack::handle(host, method, params),
         "gui/preset/list" => gui_catalog::presets(),
         "gui/model/fetch" => gui_catalog::fetch_models(state, params),
         method if method.starts_with("gui/mcp/") => super::gui_mcp::handle(host, method, params),

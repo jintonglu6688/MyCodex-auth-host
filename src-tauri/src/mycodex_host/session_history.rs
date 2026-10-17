@@ -37,6 +37,15 @@ fn set(host: &Host, params: &Value) -> Result<Value> {
     auto_capture::before_write(state)?;
     let existing = settings::get_settings();
     let changed = existing.unify_codex_session_history != unified;
+    // An official aggregation default reaches the proxy only through the shared
+    // mirror table, so the history stays unified while it is the default.
+    if changed
+        && !unified
+        && lifecycle::stack_active()
+        && lifecycle::official_in_use(state)?.is_some()
+    {
+        return Err("stack_official_requires_unified_history");
+    }
     let mut applied = false;
     if changed {
         let mut next = existing.clone();

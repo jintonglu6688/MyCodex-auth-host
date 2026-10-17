@@ -42,6 +42,8 @@ pub(super) fn apply(row: &mut DocumentMut, live: &DocumentMut) -> bool {
     let mut changed = false;
     for key in KEYS {
         match live.get(key).and_then(Item::as_value) {
+            // An aggregated model belongs to another provider; the row keeps its own.
+            Some(value) if is_stack_model(value) => (),
             Some(value) => {
                 let mut value = value.clone();
                 value.decor_mut().clear();
@@ -60,6 +62,78 @@ pub(super) fn apply(row: &mut DocumentMut, live: &DocumentMut) -> bool {
         }
     }
     changed
+}
+
+fn is_stack_model(value: &toml_edit::Value) -> bool {
+    use crate::mode::stack::{decode, Decoded};
+    value
+        .as_str()
+        .is_some_and(|model| !matches!(decode(&AppType::Codex, model), Decoded::Plain))
+}
+
+/// The live file while this host routes it, read before a restart re-attaches
+/// the route: v4 then rewrites these keys from the route row.
+pub(super) fn keep_routed() -> Option<DocumentMut> {
+    let text = auto_capture::live_config_text().ok()?;
+    if !lifecycle::owns_live(&text) {
+        return None;
+    }
+    text.parse::<DocumentMut>().ok()
+}
+
+/// Put the choices kept by [`keep_routed`] back once the route is attached
+/// again. An aggregated model returns only while it is still published.
+pub(super) fn restore_routed(state: &AppState, kept: &DocumentMut) -> Result<()> {
+    let text = auto_capture::live_config_text()?;
+    if !lifecycle::owns_live(&text) {
+        return Ok(());
+    }
+    let mut live = text
+        .parse::<DocumentMut>()
+        .map_err(|_| "invalid_live_config")?;
+    let published = || -> Vec<String> {
+        crate::mode::controller::stack_views(state, &AppType::Codex)
+            .map(|stack| {
+                stack
+                    .members
+                    .into_iter()
+                    .flat_map(|member| member.model_ids)
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    let mut changed = false;
+    for key in KEYS {
+        let Some(value) = kept.get(key).and_then(Item::as_value) else {
+            continue;
+        };
+        if is_stack_model(value)
+            && !(lifecycle::stack_active()
+                && value
+                    .as_str()
+                    .is_some_and(|model| published().iter().any(|id| id == model)))
+        {
+            continue;
+        }
+        let same = live
+            .get(key)
+            .and_then(Item::as_value)
+            .is_some_and(|current| current.to_string().trim() == value.to_string().trim());
+        if !same {
+            let mut value = value.clone();
+            value.decor_mut().clear();
+            live[key] = Item::Value(value);
+            changed = true;
+        }
+    }
+    if changed {
+        crate::config::write_text_file_private(
+            &crate::codex_config::get_codex_config_path(),
+            &live.to_string(),
+        )
+        .map_err(|_| "save_outcome_unknown")?;
+    }
+    Ok(())
 }
 
 /// Before switching away, store the current provider's live choices in its row.

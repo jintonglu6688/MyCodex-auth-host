@@ -1,8 +1,10 @@
 //! Platform policy around the v4 Codex mode services.
 //!
-//! MyCodex has no mode switch of its own: a provider that needs protocol
-//! conversion runs in v4 proxy mode with itself as the route, every other
-//! provider runs direct. Routed requests must carry this store's credential.
+//! Outside aggregation MyCodex has no mode switch of its own: a provider that
+//! needs protocol conversion runs in v4 proxy mode with itself as the route,
+//! every other provider runs direct. In aggregation (v4 Stack mode) the proxy
+//! stays on and the provider in use is the default route. Routed requests must
+//! carry this store's credential.
 use super::{service_error, Result};
 use crate::live::engine::DeviceStore;
 use crate::live::project::codex::ROUTE_ID;
@@ -123,6 +125,10 @@ pub(crate) async fn admit(mut request: Request, next: Next) -> Response {
             | "/v1/responses"
             | "/v1/v1/responses"
             | "/codex/v1/responses"
+            | "/responses/compact"
+            | "/v1/responses/compact"
+            | "/v1/v1/responses/compact"
+            | "/codex/v1/responses/compact"
             | "/models"
             | "/v1/models"
             | "/health"
@@ -264,6 +270,79 @@ pub(super) fn is_proxy() -> bool {
     mode().is_proxy()
 }
 
+/// Codex is in aggregation (v4 Stack) mode: proxy mode with the list published.
+/// The provider in use is then the default route, whatever its conversion need.
+pub(super) fn stack_active() -> bool {
+    crate::mode::stack::stack_mode_now(&AppType::Codex)
+}
+
+/// A provider that may be the aggregation default. An official default runs
+/// through the proxy; only the shared-history mirror table can carry this
+/// host's route credential, so it requires unified session history.
+pub(super) fn check_stack_default(provider: &Provider) -> Result<()> {
+    conversion(provider)?;
+    if crate::services::provider::codex_direct::is_official(provider)
+        && !crate::settings::unify_codex_session_history()
+    {
+        return Err("stack_official_requires_unified_history");
+    }
+    Ok(())
+}
+
+/// The provider in use needs another mode than the current one. Aggregation
+/// keeps the proxy for every default.
+pub(super) fn needs_mode_change(provider: &Provider) -> Result<bool> {
+    let needs_route = conversion(provider)?;
+    Ok(!stack_active() && needs_route != is_proxy())
+}
+
+/// Enter aggregation with `provider` as the default.
+pub(super) fn enter_stack(state: &AppState, provider: &Provider) -> Result<()> {
+    check_stack_default(provider)?;
+    super::session_choices::backfill(state)?;
+    super::shadowed_settings::around(state, provider, || {
+        ROUTING.store(false, Ordering::Release);
+        let result = block_on(crate::mode::controller::enter_with_route(
+            state,
+            &AppType::Codex,
+            true,
+            Some(&provider.id),
+        ))
+        .map_err(|_| "stack_enter_failed");
+        sync_routing(state);
+        result
+    })
+}
+
+/// Leave aggregation and keep `provider` (the default) in use: routed when it
+/// needs conversion, otherwise direct. The list stays for the next time.
+pub(super) fn exit_stack(state: &AppState, provider: &Provider) -> Result<()> {
+    let needs_route = conversion(provider)?;
+    super::session_choices::backfill(state)?;
+    super::shadowed_settings::around(state, provider, || {
+        ROUTING.store(false, Ordering::Release);
+        let result = if needs_route {
+            block_on(crate::mode::controller::enter_with_route(
+                state,
+                &AppType::Codex,
+                false,
+                Some(&provider.id),
+            ))
+            .map_err(|_| "stack_exit_failed")
+        } else {
+            block_on(crate::mode::controller::exit(state, &AppType::Codex))
+                .map_err(|_| "stack_exit_failed")
+                .and_then(|_| {
+                    ProviderService::switch(state, AppType::Codex, &provider.id)
+                        .map(|_| ())
+                        .map_err(service_error)
+                })
+        };
+        sync_routing(state);
+        result
+    })
+}
+
 /// Accept routed requests only while the client is attached to a running proxy.
 pub(super) fn sync_routing(state: &AppState) {
     let attached = mode().attached && block_on(state.proxy_service.is_running());
@@ -329,6 +408,16 @@ pub(super) fn activate_saved(state: &AppState, provider: &Provider) -> Result<()
 
 fn switch_to(state: &AppState, provider: &Provider) -> Result<()> {
     let needs_route = conversion(provider)?;
+    if stack_active() {
+        // Aggregation: the provider becomes the default route and joins the list.
+        check_stack_default(provider)?;
+        ROUTING.store(false, Ordering::Release);
+        let result = ProviderService::switch(state, AppType::Codex, &provider.id)
+            .map(|_| ())
+            .map_err(|_| "route_start_failed");
+        sync_routing(state);
+        return result;
+    }
     ROUTING.store(false, Ordering::Release);
     let result = if needs_route {
         if mode().is_proxy() {
@@ -392,7 +481,7 @@ pub(super) fn reconcile(state: &AppState) -> Result<()> {
         sync_routing(state);
         return Ok(());
     };
-    if conversion(&provider)? != mode().is_proxy() {
+    if needs_mode_change(&provider)? {
         return activate_saved(state, &provider);
     }
     sync_routing(state);
@@ -437,6 +526,8 @@ pub(super) fn startup(state: &AppState) -> Result<()> {
         {
             detach_external(state)?;
         }
+        // Re-attaching writes the route row's model and reasoning choices.
+        let kept = super::session_choices::keep_routed();
         let result = block_on(crate::mode::controller::startup_single(
             state,
             &AppType::Codex,
@@ -444,7 +535,15 @@ pub(super) fn startup(state: &AppState) -> Result<()> {
         .map_err(|_| "mode_startup_failed");
         sync_routing(state);
         result?;
+        if let Some(kept) = &kept {
+            // The route is up either way; a choice that cannot be restored only
+            // falls back to the row's values, as before.
+            let _ = super::session_choices::restore_routed(state, kept);
+        }
     }
+    // An official aggregation default lists the official models; refresh them
+    // now and every 15 minutes (nothing happens outside that case).
+    crate::services::provider::codex_official_models::start_background_checks(state.clone());
     // Adopt the effective identity once before serving requests.
     super::auto_capture::read(state).map(|_| ())
 }
@@ -468,6 +567,7 @@ pub(super) fn status(state: &AppState) -> Result<Value> {
             None => Value::Null,
         },
         "attached": mode.attached,
+        "stack": stack_active(),
         // Codex is routed through this host; restarting the host must resume it.
         "takeover": mode.attached,
         "running": status.running,

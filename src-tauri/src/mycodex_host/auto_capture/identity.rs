@@ -26,7 +26,18 @@ pub(super) fn identify(live: &Value) -> Result<Option<Identity>> {
             .and_then(|p| p.get(key))
             .and_then(toml::Value::as_str)
     };
-    if selected.is_some_and(|table| table.get("auth").is_some() || table.get("aws").is_some()) {
+    if selected.is_some_and(|table| table.get("aws").is_some()) {
+        return Err("unsupported_auth_source");
+    }
+    // A command (`[model_providers.<id>.auth]`) supplies the credential, as v4
+    // projects it; only the command reference is compared and saved.
+    let command = selected.and_then(|p| p.get("auth"));
+    if command.is_some_and(|value| {
+        value
+            .get("command")
+            .and_then(toml::Value::as_str)
+            .is_none_or(|command| command.trim().is_empty())
+    }) {
         return Err("unsupported_auth_source");
     }
     if source != "openai" && selected.is_none() {
@@ -96,8 +107,10 @@ pub(super) fn identify(live: &Value) -> Result<Option<Identity>> {
             }
         }
     }
-    let has_config_auth =
-        bearer.is_some() || env_key.is_some() || (!requires_openai && has_header_auth);
+    let has_config_auth = bearer.is_some()
+        || env_key.is_some()
+        || command.is_some()
+        || (!requires_openai && has_header_auth);
     let mode = live["auth"]["auth_mode"].as_str();
     if !has_config_auth
         && requires_openai
@@ -154,6 +167,8 @@ pub(super) fn identify(live: &Value) -> Result<Option<Identity>> {
         json!({"env":value})
     } else if let Some(value) = bearer {
         json!({"secret":value})
+    } else if let Some(value) = command {
+        json!({"command":value})
     } else if !requires_openai && has_header_auth {
         json!({"headers":headers,"envHeaders":env_headers})
     } else {

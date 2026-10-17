@@ -28,6 +28,7 @@ mod session_history;
 mod session_ledger;
 mod session_repair;
 mod shadowed_settings;
+mod stack;
 
 type Result<T> = std::result::Result<T, &'static str>;
 const MAX_REQUEST: usize = 1_048_576;
@@ -203,7 +204,8 @@ fn handle(host: &Host, request: &Request) -> Result<Value> {
             | "gui/mcp/save"
             | "gui/mcp/delete"
             | "gui/sessionHistory/set"
-    ) {
+    ) || (request.method.starts_with("gui/stack/") && request.method != "gui/stack/get")
+    {
         lifecycle::pause_if_external();
     }
     match request.method.as_str() {
@@ -224,6 +226,7 @@ fn handle(host: &Host, request: &Request) -> Result<Value> {
                 "runtimeConfigPreparation",
                 "unifiedSessionHistory",
                 "sessionHistoryRepair",
+                "aggregation",
             ]);
             value["route"] = lifecycle::status(state)?;
             Ok(value)

@@ -539,6 +539,58 @@ fn auto_capture_unknown_live_keeps_saved_list_and_refuses_stale_edit() {
 }
 
 #[test]
+fn auto_capture_keeps_a_command_credential_and_switches_away_and_back() {
+    let mut gui = Gui::new();
+    let config = "model='relay-model'\nmodel_provider='relay'\n[model_providers.relay]\nname='Relay'\nbase_url='http://127.0.0.1:4912/v1/relay'\nwire_api='responses'\nrequires_openai_auth=false\nhttp_headers={x-relay-actor='command-auth-v1'}\n[model_providers.relay.auth]\ncommand='C:\\Relay\\relay-hook.exe'\nargs=['--codex-provider-auth-v1']\ntimeout_ms=3000\n";
+    std::fs::write(gui.root.path().join("codex/config.toml"), config).unwrap();
+    std::fs::write(gui.root.path().join("codex/auth.json"), "{}").unwrap();
+    let external = (config.as_bytes().to_vec(), b"{}".to_vec());
+    gui.start();
+    let listed = gui.ok("gui/provider/list", json!({}));
+    assert_eq!(listed["liveState"], "current", "{listed}");
+    let relay = listed["currentProviderId"].as_str().unwrap().to_string();
+    assert!(!relay.is_empty(), "{listed}");
+    assert_live_unchanged(&gui, &external);
+
+    gui.ok("gui/provider/save", save("direct"));
+    switch_gui(&gui, "direct", "to-direct");
+    // The external table stays as user content; the route no longer selects it.
+    let live: toml::Value = gui.config().parse().unwrap();
+    let selected = live["model_provider"].as_str().unwrap();
+    assert_ne!(selected, "relay", "{live}");
+    assert!(
+        live["model_providers"][selected].get("auth").is_none(),
+        "{live}"
+    );
+    switch_gui(&gui, &relay, "to-relay");
+    let live: toml::Value = gui.config().parse().unwrap();
+    let selected = live["model_provider"].as_str().unwrap();
+    let table = &live["model_providers"][selected];
+    assert_eq!(
+        table["base_url"].as_str(),
+        Some("http://127.0.0.1:4912/v1/relay")
+    );
+    assert_eq!(
+        table["auth"]["command"].as_str(),
+        Some("C:\\Relay\\relay-hook.exe")
+    );
+    assert_eq!(
+        table["auth"]["args"][0].as_str(),
+        Some("--codex-provider-auth-v1")
+    );
+    assert_eq!(
+        table["http_headers"]["x-relay-actor"].as_str(),
+        Some("command-auth-v1")
+    );
+    assert!(table.get("experimental_bearer_token").is_none(), "{live}");
+    assert!(table.get("requires_openai_auth").is_none(), "{live}");
+    assert_eq!(
+        gui.ok("gui/provider/list", json!({}))["currentProviderId"],
+        relay
+    );
+}
+
+#[test]
 fn auto_capture_external_direct_retires_old_route_without_restoring_backup() {
     let mut gui = Gui::new();
     gui.start();
@@ -2101,4 +2153,306 @@ fn session_repair_cleans_another_providers_turns_before_the_chatgpt_account_resu
         gui.ok("gui/sessionHistory/repair", resume)["skipped"],
         "not_official"
     );
+}
+
+fn catalog_text(gui: &Gui) -> String {
+    let config: toml::Value = gui.config().parse().unwrap();
+    let catalog = config["model_catalog_json"].as_str().unwrap();
+    std::fs::read_to_string(gui.root.path().join("codex").join(catalog))
+        .or_else(|_| std::fs::read_to_string(catalog))
+        .unwrap()
+}
+
+fn stack_member_ids(view: &Value) -> Vec<String> {
+    view["members"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|member| member["providerId"].as_str().unwrap().to_string())
+        .collect()
+}
+
+#[test]
+fn aggregation_publishes_listed_providers_and_returns_to_the_default() {
+    let mut gui = Gui::new();
+    gui.start();
+    for id in ["relay-a", "relay-b"] {
+        gui.ok("gui/provider/save", save(id));
+    }
+    let mut chat = save("relay-chat");
+    chat["kind"] = json!("chat_completions");
+    gui.ok("gui/provider/save", chat);
+    switch_gui(&gui, "relay-a", "to-a");
+    assert!(gui.ok("status", json!({}))["capabilities"]
+        .as_array()
+        .unwrap()
+        .contains(&json!("aggregation")));
+    let idle = gui.ok("gui/stack/get", json!({}));
+    assert_eq!(idle["active"], false, "{idle}");
+    assert!(idle["providers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|row| row["joinRefusal"].is_null()));
+
+    let entered = gui.ok(
+        "gui/stack/enter",
+        json!({"defaultProviderId":"relay-a","memberIds":["relay-b","relay-chat"]}),
+    );
+    assert_eq!(entered["active"], true, "{entered}");
+    assert_eq!(entered["globalApplied"], true);
+    assert_eq!(entered["defaultProviderId"], "relay-a");
+    assert_eq!(
+        stack_member_ids(&entered),
+        ["relay-b", "relay-chat", "relay-a"]
+    );
+    let config: toml::Value = gui.config().parse().unwrap();
+    assert_eq!(config["model_provider"].as_str(), Some("custom"));
+    let route = &config["model_providers"]["custom"];
+    assert!(route["base_url"].as_str().unwrap().contains("127.0.0.1"));
+    assert!(route["http_headers"].get("x-mycodex-route-token").is_some());
+    let catalog = catalog_text(&gui);
+    assert!(catalog.contains("ccs-relay-b/model-a"), "{catalog}");
+    assert!(catalog.contains("ccs-relay-chat/model-a"), "{catalog}");
+    let route_status = &gui.ok("status", json!({}))["route"];
+    assert_eq!(route_status["stack"], true, "{route_status}");
+    assert_eq!(route_status["accepting"], true, "{route_status}");
+
+    let removed = gui.ok(
+        "gui/stack/member/set",
+        json!({"providerId":"relay-b","enabled":false}),
+    );
+    assert_eq!(removed["globalApplied"], true);
+    assert!(!catalog_text(&gui).contains("ccs-relay-b/"));
+    let refused = gui.call(
+        "gui/stack/member/set",
+        json!({"providerId":"relay-a","enabled":false}),
+    );
+    assert_eq!(
+        refused["error"]["message"], "stack_default_cannot_be_removed",
+        "{refused}"
+    );
+
+    // A model chosen from another provider never becomes the default's own.
+    let path = gui.root.path().join("codex/config.toml");
+    let mut doc: toml_edit::DocumentMut = gui.config().parse().unwrap();
+    doc["model"] = toml_edit::value("ccs-relay-chat/model-a");
+    std::fs::write(&path, doc.to_string()).unwrap();
+    let moved = gui.ok("gui/stack/default/set", json!({"providerId":"relay-chat"}));
+    assert_eq!(moved["defaultProviderId"], "relay-chat", "{moved}");
+    assert!(catalog_text(&gui).contains("ccs-relay-a/model-a"));
+
+    // The default needs conversion, so leaving aggregation keeps the route.
+    let left = gui.ok("gui/stack/exit", json!({}));
+    assert_eq!(left["active"], false, "{left}");
+    assert_eq!(stack_member_ids(&left), ["relay-chat", "relay-a"]);
+    let route_status = &gui.ok("status", json!({}))["route"];
+    assert_eq!(route_status["mode"], "proxy", "{route_status}");
+    assert_eq!(route_status["stack"], false, "{route_status}");
+    assert!(!catalog_text(&gui).contains("ccs-"));
+
+    gui.ok("gui/stack/enter", json!({"defaultProviderId":"relay-a"}));
+    gui.ok("gui/stack/exit", json!({}));
+    let config: toml::Value = gui.config().parse().unwrap();
+    assert!(!gui.config().contains("127.0.0.1"), "{config}");
+    assert_eq!(config["model"].as_str(), Some("model-a"), "{config}");
+    let list = gui.ok("gui/provider/list", json!({}));
+    assert_eq!(list["currentProviderId"], "relay-a");
+}
+
+#[test]
+fn aggregation_survives_a_restart_and_deleting_a_member() {
+    let mut gui = Gui::new();
+    gui.start();
+    for id in ["relay-a", "relay-b"] {
+        gui.ok("gui/provider/save", save(id));
+    }
+    switch_gui(&gui, "relay-a", "to-a");
+    gui.ok(
+        "gui/stack/enter",
+        json!({"defaultProviderId":"relay-a","memberIds":["relay-b"]}),
+    );
+    gui.stop();
+    gui.start();
+    let view = gui.ok("gui/stack/get", json!({}));
+    assert_eq!(view["active"], true, "{view}");
+    assert_eq!(gui.ok("status", json!({}))["route"]["accepting"], true);
+    let default = gui.ok("gui/provider/get", json!({"providerId":"relay-a"}));
+    let refused = gui.call(
+        "gui/provider/delete",
+        json!({"providerId":"relay-a","expectedVersion":default["version"]}),
+    );
+    assert_eq!(refused["error"]["message"], "provider_in_use", "{refused}");
+    let member = gui.ok("gui/provider/get", json!({"providerId":"relay-b"}));
+    gui.ok(
+        "gui/provider/delete",
+        json!({"providerId":"relay-b","expectedVersion":member["version"]}),
+    );
+    assert_eq!(
+        stack_member_ids(&gui.ok("gui/stack/get", json!({}))),
+        ["relay-a"]
+    );
+    assert!(!catalog_text(&gui).contains("ccs-relay-b/"));
+}
+
+#[test]
+fn aggregated_model_choices_survive_a_restart_while_still_published() {
+    let mut gui = Gui::new();
+    gui.start();
+    for id in ["relay-a", "relay-b"] {
+        gui.ok("gui/provider/save", save(id));
+    }
+    switch_gui(&gui, "relay-a", "to-a");
+    let entered = gui.ok(
+        "gui/stack/enter",
+        json!({"defaultProviderId":"relay-a","memberIds":["relay-b"]}),
+    );
+    let chosen = entered["members"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|member| member["providerId"] == "relay-b")
+        .and_then(|member| member["modelIds"][0].as_str())
+        .unwrap()
+        .to_string();
+    let choose = |gui: &Gui| {
+        let mut live: toml_edit::DocumentMut = gui.config().parse().unwrap();
+        live["model"] = toml_edit::value(chosen.as_str());
+        live["model_reasoning_effort"] = toml_edit::value("high");
+        std::fs::write(gui.root.path().join("codex/config.toml"), live.to_string()).unwrap();
+    };
+    choose(&gui);
+    gui.stop();
+    gui.start();
+    let live: toml::Value = gui.config().parse().unwrap();
+    assert_eq!(live["model"].as_str(), Some(chosen.as_str()), "{live}");
+    assert_eq!(
+        live["model_reasoning_effort"].as_str(),
+        Some("high"),
+        "{live}"
+    );
+    assert_eq!(gui.ok("status", json!({}))["route"]["accepting"], true);
+
+    // A model whose provider left the list falls back to the default's own.
+    gui.ok(
+        "gui/stack/member/set",
+        json!({"providerId":"relay-b","enabled":false}),
+    );
+    choose(&gui);
+    gui.stop();
+    gui.start();
+    let live: toml::Value = gui.config().parse().unwrap();
+    assert_eq!(live["model"].as_str(), Some("model-a"), "{live}");
+    assert_eq!(
+        live["model_reasoning_effort"].as_str(),
+        Some("high"),
+        "{live}"
+    );
+    assert_eq!(gui.ok("status", json!({}))["route"]["accepting"], true);
+}
+
+#[test]
+fn an_official_aggregation_default_needs_unified_history_and_the_route_credential() {
+    let mut gui = Gui::new();
+    external_account(&gui, "alice", "team-workspace", "model-a");
+    gui.start();
+    let account = gui.ok("gui/provider/list", json!({}))["currentProviderId"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    gui.ok("gui/provider/save", save("api"));
+    let view = gui.ok("gui/stack/get", json!({}));
+    let row = view["providers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["providerId"] == account.as_str())
+        .unwrap()
+        .clone();
+    assert_eq!(row["joinRefusal"], "stack_official_cannot_join", "{view}");
+    assert_eq!(
+        row["defaultRefusal"], "stack_official_requires_unified_history",
+        "{view}"
+    );
+    let refused = gui.call("gui/stack/enter", json!({"defaultProviderId":account}));
+    assert_eq!(
+        refused["error"]["message"], "stack_official_requires_unified_history",
+        "{refused}"
+    );
+    let refused = gui.call(
+        "gui/stack/member/set",
+        json!({"providerId":account,"enabled":true}),
+    );
+    assert_eq!(
+        refused["error"]["message"], "stack_official_cannot_join",
+        "{refused}"
+    );
+
+    gui.ok("gui/sessionHistory/set", json!({"unified":true}));
+    let entered = gui.ok("gui/stack/enter", json!({"defaultProviderId":account}));
+    assert_eq!(entered["active"], true, "{entered}");
+    let config: toml::Value = gui.config().parse().unwrap();
+    let mirror = &config["model_providers"]["custom"];
+    assert_eq!(
+        mirror["requires_openai_auth"].as_bool(),
+        Some(true),
+        "{config}"
+    );
+    assert!(mirror["base_url"].as_str().unwrap().contains("127.0.0.1"));
+    assert!(mirror["http_headers"]
+        .get("x-mycodex-route-token")
+        .is_some());
+    assert_eq!(gui.ok("status", json!({}))["route"]["accepting"], true);
+    let refused = gui.call("gui/sessionHistory/set", json!({"unified":false}));
+    assert_eq!(
+        refused["error"]["message"], "stack_official_requires_unified_history",
+        "{refused}"
+    );
+
+    gui.ok("gui/stack/exit", json!({}));
+    assert!(!gui.config().contains("127.0.0.1"), "{}", gui.config());
+}
+
+#[test]
+fn routed_compaction_is_admitted_only_with_the_route_credential() {
+    use std::io::Read;
+    let mut gui = Gui::new();
+    gui.start();
+    for id in ["relay-a", "relay-b"] {
+        gui.ok("gui/provider/save", save(id));
+    }
+    switch_gui(&gui, "relay-a", "to-a");
+    gui.ok(
+        "gui/stack/enter",
+        json!({"defaultProviderId":"relay-a","memberIds":["relay-b"]}),
+    );
+    let port = gui.ok("status", json!({}))["route"]["port"]
+        .as_u64()
+        .unwrap() as u16;
+    let config: toml::Value = gui.config().parse().unwrap();
+    let token = config["model_providers"]["custom"]["http_headers"]["x-mycodex-route-token"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let send = |header: &str| {
+        let mut stream = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+        stream
+            .set_read_timeout(Some(std::time::Duration::from_secs(20)))
+            .unwrap();
+        let body = "not json";
+        write!(
+            stream,
+            "POST /v1/responses/compact HTTP/1.1\r\nHost: 127.0.0.1\r\n{header}Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        )
+        .unwrap();
+        let mut reply = String::new();
+        let _ = stream.read_to_string(&mut reply);
+        reply
+    };
+    let anonymous = send("");
+    assert!(anonymous.starts_with("HTTP/1.1 401"), "{anonymous}");
+    let admitted = send(&format!("x-mycodex-route-token: {token}\r\n"));
+    assert!(!admitted.contains("route_not_supported"), "{admitted}");
+    assert!(!admitted.starts_with("HTTP/1.1 401"), "{admitted}");
 }

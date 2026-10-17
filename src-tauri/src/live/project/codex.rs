@@ -501,6 +501,13 @@ pub fn official_mirror_table(base_url: Option<&str>, supports_websockets: bool) 
     table.insert("wire_api", toml_edit::value("responses"));
     if let Some(base_url) = base_url {
         table.insert("base_url", toml_edit::value(base_url.trim_end_matches('/')));
+        // MyCodex: an address is only given for the local proxy, which admits only
+        // requests carrying the host's route credential.
+        if let Some((header, token)) = crate::mycodex_host::lifecycle::route_credential() {
+            let mut headers = Table::new();
+            headers.insert(header, toml_edit::value(token));
+            table.insert("http_headers", Item::Table(headers));
+        }
     }
     table
 }
