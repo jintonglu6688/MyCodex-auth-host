@@ -4,7 +4,7 @@
 
 ## 仓库与入口
 
-| 职责 | 仓库 | 本机目录 |
+| 职责 | 仓库 | 本机目录（示例） |
 | --- | --- | --- |
 | 后台源码、四平台云构建和 GitHub Release | `jintonglu6688/MyCodex-auth-host`（GitHub） | `E:\MyCodex-auth-core` |
 | GitCode 镜像脚本及下载产物 | `gcw_SpGZ48lW/mycodex-auth-host`（GitCode） | `E:\MyCodex-auth-gitcode` |

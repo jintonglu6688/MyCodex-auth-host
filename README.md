@@ -1,3 +1,14 @@
+> [!NOTE]
+> **This is MyCodex Auth Host, a fork of [CC Switch](https://github.com/farion1231/cc-switch).**
+> It adds a headless host (`mycodex-auth-host`) that the [MyCodex](https://github.com/jintonglu6688/MyCodex) Windows client uses as its authentication center: Codex providers, ChatGPT accounts, provider aggregation (Stack mode), the local conversion route, and session history repair, for Windows, WSL, and SSH targets.
+> It is not the official CC Switch project; the official website is [ccswitch.io](https://ccswitch.io). Please report problems with MyCodex-specific behavior here, not upstream.
+>
+> - MyCodex additions: `src-tauri/src/mycodex_host*`, `src-tauri/tests/mycodex_*`, `scripts/*MyCodex*`, and [`docs/mycodex-auth-*.md`](docs/mycodex-auth-release.md)
+> - Releases: `auth-core-vX.Y.Z` tags built by the `auth-core-release.yml` workflow
+> - License: MIT, keeping the upstream copyright notice in [LICENSE](LICENSE)
+>
+> The upstream CC Switch README follows.
+
 <div align="center">
 
 # CC Switch

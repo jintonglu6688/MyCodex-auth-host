@@ -1,3 +1,14 @@
+> [!NOTE]
+> **这是 MyCodex 认证后端（MyCodex Auth Host），[CC Switch](https://github.com/farion1231/cc-switch) 的分支。**
+> 它增加了无界面宿主 `mycodex-auth-host`，作为 [MyCodex](https://github.com/jintonglu6688/MyCodex) Windows 客户端的认证中心：Codex 提供商、ChatGPT 账号、提供商聚合（Stack 模式）、本地协议转换路由和会话历史修复，支持 Windows、WSL 和 SSH 目标。
+> 本仓库不是 CC Switch 官方项目，官方网站是 [ccswitch.io](https://ccswitch.io)。MyCodex 相关功能的问题请在本仓库反馈，不要提交到上游。
+>
+> - MyCodex 新增部分：`src-tauri/src/mycodex_host*`、`src-tauri/tests/mycodex_*`、`scripts/*MyCodex*` 和 [`docs/mycodex-auth-*.md`](docs/mycodex-auth-release.md)
+> - 发布：`auth-core-vX.Y.Z` 标签，由 `auth-core-release.yml` 工作流构建
+> - 许可：MIT，[LICENSE](LICENSE) 中保留上游版权声明
+>
+> 以下为上游 CC Switch 原始说明。
+
 <div align="center">
 
 # CC Switch
