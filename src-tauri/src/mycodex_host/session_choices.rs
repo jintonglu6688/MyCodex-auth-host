@@ -136,6 +136,102 @@ pub(super) fn restore_routed(state: &AppState, kept: &DocumentMut) -> Result<()>
     Ok(())
 }
 
+const EXIT_CHOICES: &str = "mycodex.exitChoices";
+
+/// What the next start finds after an exit pointed Codex back to direct.
+pub(super) enum AfterExit {
+    /// The client still uses the direct file written at exit; these choices
+    /// return once the route is attached again.
+    Unchanged(DocumentMut),
+    /// Someone switched the client to another provider meanwhile.
+    Replaced,
+}
+
+/// The provider a live file sends requests to: `model_provider` and its table.
+fn direct_identity(doc: &DocumentMut) -> String {
+    let id = doc
+        .get("model_provider")
+        .and_then(Item::as_str)
+        .unwrap_or("");
+    let table = doc
+        .get("model_providers")
+        .and_then(|providers| providers.get(id))
+        .map(Item::to_string)
+        .unwrap_or_default();
+    format!("{id}\n{table}")
+}
+
+fn choice(doc: &DocumentMut, key: &str) -> Option<String> {
+    let mut value = doc.get(key).and_then(Item::as_value)?.clone();
+    value.decor_mut().clear();
+    Some(value.to_string())
+}
+
+fn choices(doc: &DocumentMut) -> serde_json::Map<String, serde_json::Value> {
+    KEYS.iter()
+        .filter_map(|key| choice(doc, key).map(|value| (key.to_string(), json!(value))))
+        .collect()
+}
+
+/// After an exit wrote the direct file: remember the routed choices, and the
+/// direct file's provider and choices to recognise it on the next start.
+pub(super) fn remember_for_exit(state: &AppState, routed: &DocumentMut) -> Result<()> {
+    let live = auto_capture::live_config_text()?
+        .parse::<DocumentMut>()
+        .map_err(|_| "invalid_live_config")?;
+    let record = json!({
+        "identity": direct_identity(&live),
+        "direct": choices(&live),
+        "routed": choices(routed),
+    });
+    state
+        .db
+        .set_setting(EXIT_CHOICES, &record.to_string())
+        .map_err(service_error)
+}
+
+/// Read and forget what [`remember_for_exit`] stored. A choice changed in the
+/// client while the route was down wins over the routed one.
+pub(super) fn after_exit(state: &AppState) -> Result<Option<AfterExit>> {
+    let text = state.db.get_setting(EXIT_CHOICES).map_err(service_error)?;
+    let Some(text) = text.filter(|text| !text.is_empty()) else {
+        return Ok(None);
+    };
+    state
+        .db
+        .set_setting(EXIT_CHOICES, "")
+        .map_err(service_error)?;
+    let mode = lifecycle::mode();
+    if mode.attached || !mode.is_proxy() {
+        return Ok(None);
+    }
+    let Ok(record) = serde_json::from_str::<serde_json::Value>(&text) else {
+        return Ok(None);
+    };
+    let Some(live) = auto_capture::live_config_text()
+        .ok()
+        .and_then(|text| text.parse::<DocumentMut>().ok())
+    else {
+        return Ok(None);
+    };
+    if record["identity"].as_str() != Some(direct_identity(&live).as_str()) {
+        return Ok(Some(AfterExit::Replaced));
+    }
+    let mut kept = DocumentMut::new();
+    for key in KEYS {
+        let now = choice(&live, key);
+        let value = if now.as_deref() == record["direct"][key].as_str() {
+            record["routed"][key].as_str().map(str::to_string)
+        } else {
+            now
+        };
+        if let Some(value) = value.and_then(|value| value.parse::<toml_edit::Value>().ok()) {
+            kept[key] = Item::Value(value);
+        }
+    }
+    Ok(Some(AfterExit::Unchanged(kept)))
+}
+
 /// Before switching away, store the current provider's live choices in its row.
 pub(super) fn backfill(state: &AppState) -> Result<()> {
     let current = ProviderService::current(state, AppType::Codex).map_err(service_error)?;

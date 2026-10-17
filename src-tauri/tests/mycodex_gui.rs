@@ -2351,6 +2351,152 @@ fn aggregated_model_choices_survive_a_restart_while_still_published() {
     assert_eq!(gui.ok("status", json!({}))["route"]["accepting"], true);
 }
 
+fn exit_application(gui: &mut Gui) {
+    let stopped = gui.ok("backend/shutdown", json!({"forUpdate":true,"detach":true}));
+    assert_eq!(stopped["status"], "shutting_down");
+    if let Some(mut child) = gui.child.take() {
+        child.wait().unwrap();
+    }
+}
+
+fn routed(config: &str) -> bool {
+    config.contains("127.0.0.1") && config.contains("x-mycodex-route-token")
+}
+
+#[test]
+fn exit_points_codex_to_the_default_directly_and_the_next_start_routes_again() {
+    let mut gui = Gui::new();
+    gui.start();
+    gui.ok("gui/provider/save", save("relay-a"));
+    let mut other = save("relay-b");
+    other["baseUrl"] = json!("https://relay-b.invalid/v1");
+    other["model"] = json!("model-b");
+    other["models"][0]["model"] = json!("model-b");
+    gui.ok("gui/provider/save", other);
+    switch_gui(&gui, "relay-a", "to-a");
+    gui.ok(
+        "gui/stack/enter",
+        json!({"defaultProviderId":"relay-a","memberIds":["relay-b"]}),
+    );
+    // The default changes after entering; the direct file must follow it.
+    let view = gui.ok("gui/stack/default/set", json!({"providerId":"relay-b"}));
+    let chosen = view["members"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|member| member["providerId"] == "relay-a")
+        .and_then(|member| member["modelIds"][0].as_str())
+        .unwrap()
+        .to_string();
+    let mut live: toml_edit::DocumentMut = gui.config().parse().unwrap();
+    live["model"] = toml_edit::value(chosen.as_str());
+    live["model_reasoning_effort"] = toml_edit::value("high");
+    std::fs::write(gui.root.path().join("codex/config.toml"), live.to_string()).unwrap();
+
+    exit_application(&mut gui);
+    let direct = gui.config();
+    assert!(!routed(&direct), "{direct}");
+    assert!(direct.contains("https://relay-b.invalid/v1"), "{direct}");
+    let live: toml::Value = direct.parse().unwrap();
+    // The aggregated model has no direct form; the default's own one is used.
+    assert_eq!(live["model"].as_str(), Some("model-b"), "{live}");
+    assert_eq!(
+        live["model_reasoning_effort"].as_str(),
+        Some("high"),
+        "{live}"
+    );
+
+    gui.start();
+    let config = gui.config();
+    assert!(routed(&config), "{config}");
+    let live: toml::Value = config.parse().unwrap();
+    assert_eq!(live["model"].as_str(), Some(chosen.as_str()), "{live}");
+    assert_eq!(
+        live["model_reasoning_effort"].as_str(),
+        Some("high"),
+        "{live}"
+    );
+    assert_eq!(gui.ok("status", json!({}))["route"]["accepting"], true);
+    assert_eq!(gui.ok("gui/stack/get", json!({}))["active"], true);
+
+    // A choice made in Codex while MyCodex was closed wins.
+    exit_application(&mut gui);
+    let mut live: toml_edit::DocumentMut = gui.config().parse().unwrap();
+    live["model_reasoning_effort"] = toml_edit::value("low");
+    std::fs::write(gui.root.path().join("codex/config.toml"), live.to_string()).unwrap();
+    gui.start();
+    let live: toml::Value = gui.config().parse().unwrap();
+    assert_eq!(live["model"].as_str(), Some(chosen.as_str()), "{live}");
+    assert_eq!(
+        live["model_reasoning_effort"].as_str(),
+        Some("low"),
+        "{live}"
+    );
+
+    // A client switched to another endpoint meanwhile keeps it, as when it is
+    // switched while routed: the next start stays direct.
+    exit_application(&mut gui);
+    let switched = gui
+        .config()
+        .replace("https://relay-b.invalid/v1", "https://elsewhere.invalid/v1");
+    std::fs::write(gui.root.path().join("codex/config.toml"), &switched).unwrap();
+    gui.start();
+    assert_eq!(gui.config(), switched);
+    assert_eq!(gui.ok("status", json!({}))["route"]["attached"], false);
+    assert_eq!(gui.ok("gui/stack/get", json!({}))["active"], false);
+}
+
+#[test]
+fn exit_points_codex_back_to_an_official_default_directly() {
+    let mut gui = Gui::new();
+    external_account(&gui, "alice", "team-workspace", "model-a");
+    gui.start();
+    let account = gui.ok("gui/provider/list", json!({}))["currentProviderId"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    gui.ok("gui/provider/save", save("api"));
+    gui.ok("gui/sessionHistory/set", json!({"unified":true}));
+    gui.ok(
+        "gui/stack/enter",
+        json!({"defaultProviderId":account,"memberIds":["api"]}),
+    );
+    assert!(routed(&gui.config()));
+    let auth = std::fs::read(gui.root.path().join("codex/auth.json")).unwrap();
+    exit_application(&mut gui);
+    let direct = gui.config();
+    assert!(!routed(&direct), "{direct}");
+    let live: toml::Value = direct.parse().unwrap();
+    assert_eq!(
+        live["model_providers"]["custom"]["requires_openai_auth"].as_bool(),
+        Some(true),
+        "{live}"
+    );
+    // The login is the client's own: exit leaves it as it is.
+    assert_eq!(
+        std::fs::read(gui.root.path().join("codex/auth.json")).unwrap(),
+        auth
+    );
+    // Attaching an official route again needs a token refresh, which the
+    // synthetic account cannot do offline; the restart is covered above.
+}
+
+#[test]
+fn exit_keeps_the_route_of_a_provider_that_needs_conversion() {
+    let mut gui = Gui::new();
+    gui.start();
+    let mut provider = save("chat");
+    provider["kind"] = json!("chat_completions");
+    gui.ok("gui/provider/save", provider);
+    switch_gui(&gui, "chat", "to-chat");
+    let before = gui.config();
+    assert!(routed(&before), "{before}");
+    exit_application(&mut gui);
+    assert_eq!(gui.config(), before);
+    gui.start();
+    assert_eq!(gui.ok("status", json!({}))["route"]["accepting"], true);
+}
+
 #[test]
 fn an_official_aggregation_default_needs_unified_history_and_the_route_credential() {
     let mut gui = Gui::new();

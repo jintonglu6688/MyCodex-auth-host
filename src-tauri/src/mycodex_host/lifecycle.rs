@@ -5,9 +5,11 @@
 //! every other provider runs direct. In aggregation (v4 Stack mode) the proxy
 //! stays on and the provider in use is the default route. Routed requests must
 //! carry this store's credential.
+use super::session_choices::AfterExit;
 use super::{service_error, Result};
 use crate::live::engine::DeviceStore;
 use crate::live::project::codex::ROUTE_ID;
+use crate::mode::current::Purpose;
 use crate::mode::state::{Mode, ModeState, PendingTarget};
 use crate::{AppState, AppType, Provider, ProviderService};
 use axum::{
@@ -262,7 +264,7 @@ pub(super) fn configure(state: &AppState) -> Result<()> {
     initialize_route_token(state)
 }
 
-fn mode() -> ModeState {
+pub(super) fn mode() -> ModeState {
     crate::mode::current::mode_state(&AppType::Codex)
 }
 
@@ -527,7 +529,15 @@ pub(super) fn startup(state: &AppState) -> Result<()> {
             detach_external(state)?;
         }
         // Re-attaching writes the route row's model and reasoning choices.
-        let kept = super::session_choices::keep_routed();
+        let kept = match super::session_choices::after_exit(state)? {
+            Some(AfterExit::Unchanged(kept)) => Some(kept),
+            // Like a switch made while attached: keep their files, run direct.
+            Some(AfterExit::Replaced) => {
+                detach_external(state)?;
+                None
+            }
+            None => super::session_choices::keep_routed(),
+        };
         let result = block_on(crate::mode::controller::startup_single(
             state,
             &AppType::Codex,
@@ -546,6 +556,60 @@ pub(super) fn startup(state: &AppState) -> Result<()> {
     crate::services::provider::codex_official_models::start_background_checks(state.clone());
     // Adopt the effective identity once before serving requests.
     super::auto_capture::read(state).map(|_| ())
+}
+
+/// Application exit: point Codex back to the provider in use directly, as CC
+/// Switch does when it quits. Mode, route and list stay, so the next start
+/// attaches again and returns the routed choices. A provider that needs
+/// conversion has no direct form and keeps the route.
+pub(super) fn detach_for_exit(state: &AppState) -> Result<()> {
+    let current = mode();
+    if !current.attached || !current.is_proxy() {
+        return Ok(());
+    }
+    let text = super::auto_capture::live_config_text()?;
+    // Switched by someone else: the next start keeps their files.
+    if !owns_live(&text) {
+        return Ok(());
+    }
+    let Some(route) = current
+        .proxy_route
+        .as_deref()
+        .map(|id| state.db.get_provider_by_id(id, "codex"))
+        .transpose()
+        .map_err(service_error)?
+        .flatten()
+    else {
+        return Ok(());
+    };
+    if conversion(&route)? {
+        return Ok(());
+    }
+    let routed = text
+        .parse::<toml_edit::DocumentMut>()
+        .map_err(|_| "invalid_live_config")?;
+    super::session_choices::backfill(state)?;
+    ROUTING.store(false, Ordering::Release);
+    {
+        // The direct file is written for the direct pointer; make it the default.
+        let _guard = crate::mode::controller::lock_settled_blocking(state, &AppType::Codex)
+            .map_err(service_error)?;
+        let pointer =
+            crate::mode::current::provider_for(&state.db, &AppType::Codex, Purpose::Direct)
+                .map_err(service_error)?;
+        if pointer.as_deref() != Some(route.id.as_str()) {
+            crate::mode::operation::commit_target(
+                &state.db,
+                &DeviceStore::for_device(),
+                AppType::Codex.as_str(),
+                &PendingTarget::pointer(Some(route.id.clone())),
+            )
+            .map_err(service_error)?;
+        }
+    }
+    block_on(crate::mode::controller::detach(state, &AppType::Codex))
+        .map_err(|_| "route_detach_failed")?;
+    super::session_choices::remember_for_exit(state, &routed)
 }
 
 // An explicit maintenance stop must remain possible with malformed live files.

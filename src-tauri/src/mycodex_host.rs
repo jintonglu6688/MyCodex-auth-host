@@ -241,6 +241,11 @@ fn handle(host: &Host, request: &Request) -> Result<Value> {
             if gui_accounts::login_pending(host)? {
                 return Err("login_in_progress");
             }
+            // Application exit: Codex keeps working directly while this host is
+            // down. Exit must not fail on it; a failed detach keeps the route.
+            if p.get("detach").and_then(Value::as_bool) == Some(true) {
+                let _ = lifecycle::detach_for_exit(state);
+            }
             // Keep the route and its mode for a replacement process; a plain stop
             // while Codex is routed here would leave Codex without its endpoint.
             if for_update == Some(false) && lifecycle::status(state)?["attached"] == true {

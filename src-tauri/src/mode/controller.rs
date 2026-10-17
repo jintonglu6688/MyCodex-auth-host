@@ -902,6 +902,14 @@ pub async fn detach_all(state: &AppState) {
     }
 }
 
+/// 只把一个应用的客户端指回直连，模式和路由不变；代理服务由调用方决定是否停掉。
+pub async fn detach(state: &AppState, app: &AppType) -> Result<(), String> {
+    let _guard = lock_settled(state, app)
+        .await
+        .map_err(|error| error.to_string())?;
+    exit_locked(state, app, true)
+}
+
 /// 代理模式下手动换路由。调用方持有切换锁。直连指针不变。
 pub async fn switch_route_locked(
     state: &AppState,
