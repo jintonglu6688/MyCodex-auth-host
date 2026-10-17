@@ -228,7 +228,7 @@ impl Resident {
         assert_eq!(ready["event"], "ready");
         assert_eq!(ready["protocolVersion"], protocol);
         if protocol == 3 {
-            assert_eq!(ready["hostVersion"], "0.3.6");
+            assert_eq!(ready["hostVersion"], "0.3.7");
             assert_eq!(
                 ready["sourceRevision"],
                 env!("MYCODEX_CORE_SOURCE_REVISION")
@@ -330,7 +330,7 @@ fn build_identity_is_independent_of_runtime_checkout_and_matches_resident() {
     assert!(output.status.success());
     let identity: Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(identity["protocolVersion"], 3);
-    assert_eq!(identity["hostVersion"], "0.3.6");
+    assert_eq!(identity["hostVersion"], "0.3.7");
     assert_eq!(
         identity["sourceRevision"],
         env!("MYCODEX_CORE_SOURCE_REVISION")
