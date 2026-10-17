@@ -6,6 +6,7 @@ use crate::app_config::AppType;
 use crate::config::{get_claude_settings_path, read_json_file};
 use crate::database::Database;
 use crate::provider::Provider;
+use crate::proxy::providers::codex_oauth_auth::CodexOAuthManager;
 use crate::proxy::server::ProxyServer;
 use crate::proxy::switch_lock::SwitchLockManager;
 use crate::proxy::types::*;
@@ -22,6 +23,8 @@ pub struct ProxyService {
     server: Arc<RwLock<Option<ProxyServer>>>,
     /// AppHandle，用于传递给 ProxyServer 以支持故障转移时的 UI 更新
     app_handle: Arc<RwLock<Option<tauri::AppHandle>>>,
+    /// ChatGPT 账号管理器；无界面宿主没有 AppHandle，代理只能从这里取账号令牌。
+    codex_oauth: Option<Arc<CodexOAuthManager>>,
     switch_locks: SwitchLockManager,
 }
 
@@ -62,8 +65,15 @@ impl ProxyService {
             db,
             server: Arc::new(RwLock::new(None)),
             app_handle: Arc::new(RwLock::new(None)),
+            codex_oauth: None,
             switch_locks: SwitchLockManager::new(),
         }
+    }
+
+    /// 让代理用这个 ChatGPT 账号管理器取令牌。
+    pub fn with_codex_oauth(mut self, manager: Arc<CodexOAuthManager>) -> Self {
+        self.codex_oauth = Some(manager);
+        self
     }
 
     /// 设置 AppHandle（在应用初始化时调用）
@@ -137,7 +147,8 @@ impl ProxyService {
 
         // 4. 创建并启动服务器
         let app_handle = self.app_handle.read().await.clone();
-        let server = ProxyServer::new(config.clone(), self.db.clone(), app_handle);
+        let server = ProxyServer::new(config.clone(), self.db.clone(), app_handle)
+            .with_codex_oauth(self.codex_oauth.clone());
         let info = server
             .start()
             .await
@@ -565,7 +576,8 @@ impl ProxyService {
     /// 按 `config` 起一个新服务，动态端口回写进库。
     async fn start_with(&self, config: &ProxyConfig) -> Result<ProxyServer, String> {
         let app_handle = self.app_handle.read().await.clone();
-        let server = ProxyServer::new(config.clone(), self.db.clone(), app_handle);
+        let server = ProxyServer::new(config.clone(), self.db.clone(), app_handle)
+            .with_codex_oauth(self.codex_oauth.clone());
         let info = server.start().await.map_err(|e| e.to_string())?;
         if let Err(e) = self
             .persist_ephemeral_listen_port_if_needed(config, info.port)

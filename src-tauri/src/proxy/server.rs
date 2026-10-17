@@ -18,6 +18,7 @@ use super::{
     ProxyError,
 };
 use crate::database::Database;
+use crate::proxy::providers::codex_oauth_auth::CodexOAuthManager;
 use axum::{
     extract::DefaultBodyLimit,
     routing::{any, get, post},
@@ -48,6 +49,8 @@ pub struct ProxyState {
     pub app_handle: Option<tauri::AppHandle>,
     /// 故障转移切换管理器
     pub failover_manager: Arc<FailoverSwitchManager>,
+    /// ChatGPT 账号管理器；没有 AppHandle 时用它取账号令牌。
+    pub codex_oauth: Option<Arc<CodexOAuthManager>>,
 }
 
 /// 代理HTTP服务器
@@ -89,6 +92,7 @@ impl ProxyServer {
             codex_chat_history: Arc::new(CodexChatHistoryStore::default()),
             app_handle,
             failover_manager,
+            codex_oauth: None,
         };
 
         Self {
@@ -97,6 +101,12 @@ impl ProxyServer {
             shutdown_tx: Arc::new(RwLock::new(None)),
             server_handle: Arc::new(RwLock::new(None)),
         }
+    }
+
+    /// 让请求用这个 ChatGPT 账号管理器取令牌。
+    pub fn with_codex_oauth(mut self, manager: Option<Arc<CodexOAuthManager>>) -> Self {
+        self.state.codex_oauth = manager;
+        self
     }
 
     pub async fn start(&self) -> Result<ProxyServerInfo, ProxyError> {

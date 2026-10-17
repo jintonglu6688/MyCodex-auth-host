@@ -291,6 +291,7 @@ impl RequestContext {
             max_retries,
         )
         .stack_request(self.is_stack)
+        .codex_oauth(state.codex_oauth.clone())
     }
 
     /// 获取 Provider 列表（用于故障转移）

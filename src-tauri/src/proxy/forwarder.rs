@@ -27,6 +27,7 @@ use super::{
     ProxyError,
 };
 use crate::commands::{CodexOAuthState, CopilotAuthState, XaiOAuthState};
+use crate::proxy::providers::codex_oauth_auth::CodexOAuthManager;
 use crate::proxy::providers::copilot_auth::{CopilotAuthError, CopilotAuthManager};
 use crate::proxy::providers::copilot_model_map::{
     CopilotProtocol, CopilotTransport, ResolvedCopilotModel,
@@ -375,6 +376,8 @@ pub struct RequestForwarder {
     /// Stack 模型的请求（`mode::stack`）：挂在结构体上，整流器重试再次调用 `forward()` 时照样
     /// 生效。见 [`Self::routing_state_enabled`]。
     stack_request: bool,
+    /// ChatGPT 账号管理器；无界面宿主没有 AppHandle，从这里取账号令牌。
+    codex_oauth: Option<Arc<CodexOAuthManager>>,
 }
 
 impl RequestForwarder {
@@ -490,6 +493,7 @@ impl RequestForwarder {
             ),
             max_attempts,
             stack_request: false,
+            codex_oauth: None,
         }
     }
 
@@ -497,6 +501,21 @@ impl RequestForwarder {
     pub fn stack_request(mut self, stack_request: bool) -> Self {
         self.stack_request = stack_request;
         self
+    }
+
+    /// 指定取 ChatGPT 账号令牌用的管理器。
+    pub fn codex_oauth(mut self, manager: Option<Arc<CodexOAuthManager>>) -> Self {
+        self.codex_oauth = manager;
+        self
+    }
+
+    /// ChatGPT 账号管理器：优先用显式传入的，桌面版再退回 AppHandle 里托管的那份。
+    fn codex_oauth_manager(&self) -> Option<Arc<CodexOAuthManager>> {
+        self.codex_oauth.clone().or_else(|| {
+            self.app_handle
+                .as_ref()
+                .map(|app_handle| app_handle.state::<CodexOAuthState>().0.clone())
+        })
     }
 
     /// 这个请求读写路由状态吗：熔断器（许可、结果、健康度）、「正在使用」、代理统计
@@ -1421,12 +1440,10 @@ impl RequestForwarder {
                 .and_then(|meta| meta.managed_account_id_for("codex_oauth"))
             {
                 Some(local_account_id) => {
-                    let app_handle = self.app_handle.as_ref().ok_or_else(|| {
+                    let codex_auth = self.codex_oauth_manager().ok_or_else(|| {
                         ProxyError::AuthError("Codex OAuth 认证不可用（无 AppHandle）".to_string())
                     })?;
-                    let codex_state = app_handle.state::<CodexOAuthState>();
-                    let chatgpt_account_id = codex_state
-                        .0
+                    let chatgpt_account_id = codex_auth
                         .chatgpt_account_id_for_account(&local_account_id)
                         .await
                         .map_err(|error| {
@@ -2140,10 +2157,7 @@ impl RequestForwarder {
 
             // Codex OAuth 特殊处理：从 CodexOAuthManager 获取真实 access_token
             if auth.strategy == AuthStrategy::CodexOAuth {
-                if let Some(app_handle) = &self.app_handle {
-                    let codex_state = app_handle.state::<CodexOAuthState>();
-                    let codex_auth = &codex_state.0;
-
+                if let Some(codex_auth) = self.codex_oauth_manager() {
                     // 从 provider.meta 获取关联的 ChatGPT 账号 ID
                     let account_id = provider
                         .meta
@@ -4709,6 +4723,7 @@ mod tests {
             streaming_first_byte_timeout,
             max_attempts: 1,
             stack_request: false,
+            codex_oauth: None,
         }
     }
 
@@ -6298,6 +6313,54 @@ mod tests {
                     forwarder.categorize_proxy_error(&error, &copilot),
                     ErrorCategory::NonRetryable
                 );
+            }
+        }
+    }
+
+    /// 无界面宿主没有 AppHandle：ChatGPT 账号提供商要从传入的账号管理器解析账号。
+    #[tokio::test]
+    async fn codex_managed_account_resolves_without_app_handle() {
+        let mut provider = test_provider_with_type(Some("codex_oauth"));
+        provider.category = Some("official".to_string());
+        provider.settings_config = json!({ "auth": {}, "config": "" });
+        provider.meta.as_mut().unwrap().auth_binding = Some(crate::provider::AuthBinding {
+            source: crate::provider::AuthBindingSource::ManagedAccount,
+            auth_provider: Some("codex_oauth".to_string()),
+            account_id: Some("missing-account".to_string()),
+        });
+        let adapter = get_adapter(&AppType::Codex).unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let manager = Arc::new(CodexOAuthManager::new(temp.path().to_path_buf()));
+
+        for manager in [None, Some(manager)] {
+            let with_manager = manager.is_some();
+            let forwarder = test_forwarder(Duration::ZERO, Duration::ZERO)
+                .stack_request(true)
+                .codex_oauth(manager);
+            let mut codex_upstream_format = None;
+            let error = match forwarder
+                .forward(
+                    &AppType::Codex,
+                    &http::Method::POST,
+                    &provider,
+                    "/v1/responses",
+                    &json!({"model": "gpt-5.5"}),
+                    &HeaderMap::new(),
+                    &Extensions::new(),
+                    adapter.as_ref(),
+                    &mut codex_upstream_format,
+                )
+                .await
+            {
+                Err(error) => error,
+                Ok(_) => panic!("unknown account must not reach upstream"),
+            };
+            let ProxyError::AuthError(message) = error else {
+                panic!("expected auth error, got {error:?}");
+            };
+            assert_eq!(message.contains("AppHandle"), !with_manager, "{message}");
+            if with_manager {
+                assert!(message.contains("账号解析失败"), "{message}");
             }
         }
     }
