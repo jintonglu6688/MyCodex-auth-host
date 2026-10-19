@@ -31,7 +31,7 @@ pub(super) fn identity() -> Result<Value> {
         .map_err(|code| *code)?;
     Ok(json!({
         "protocolVersion": PROTOCOL_VERSION,
-        "hostVersion": "0.3.8",
+        "hostVersion": "0.3.9",
         "upstreamRevision": UPSTREAM,
         "sourceRevision": env!("MYCODEX_CORE_SOURCE_REVISION"),
         "sourceDirty": env!("MYCODEX_CORE_SOURCE_DIRTY") != "false",
