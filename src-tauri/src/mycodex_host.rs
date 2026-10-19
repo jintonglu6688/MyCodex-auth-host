@@ -227,6 +227,7 @@ fn handle(host: &Host, request: &Request) -> Result<Value> {
                 "unifiedSessionHistory",
                 "sessionHistoryRepair",
                 "aggregation",
+                "inactiveSaveWhileBusy",
             ]);
             value["route"] = lifecycle::status(state)?;
             Ok(value)

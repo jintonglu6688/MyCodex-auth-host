@@ -92,6 +92,63 @@ pub(super) fn edit_base(host: &Host, params: &Value) -> Result<(Option<Provider>
     Ok((previous, edited))
 }
 
+/// The lock a provider write holds. Without routed requests it is the usual
+/// `mutation`; while they stream, only rows that are not in use can be stored,
+/// and only when the client is still on this host's unchanged route.
+enum WriteGate {
+    Exclusive(#[allow(dead_code)] tokio::sync::OwnedRwLockWriteGuard<()>),
+    Beside(#[allow(dead_code)] lifecycle::BesideRequests),
+}
+
+impl WriteGate {
+    fn enter(state: &crate::AppState) -> Result<Self> {
+        match lifecycle::mutation() {
+            Ok(guard) => Ok(Self::Exclusive(guard)),
+            Err(error) => {
+                let beside = lifecycle::beside_requests().map_err(|_| error)?;
+                auto_capture::steady_route(state)?.ok_or(error)?;
+                Ok(Self::Beside(beside))
+            }
+        }
+    }
+
+    fn beside(&self) -> bool {
+        matches!(self, Self::Beside(_))
+    }
+
+    /// The steady route needs no capture, and no credential recovery applies to it.
+    fn recovery(&self, state: &crate::AppState) -> Result<bool> {
+        if self.beside() {
+            return Ok(false);
+        }
+        auto_capture::before_write_or_credential_recovery(state)
+    }
+}
+
+/// Saving this row would change what the client uses: the provider in use, the
+/// direct provider restored on exit, the first provider, or an aggregated one.
+fn in_use(state: &crate::AppState, id: &str) -> Result<bool> {
+    let current = ProviderService::current(state, AppType::Codex).map_err(service_error)?;
+    if current.is_empty() || current == id {
+        return Ok(true);
+    }
+    let direct = crate::mode::current::provider_for(
+        &state.db,
+        &AppType::Codex,
+        crate::mode::current::Purpose::Direct,
+    )
+    .map_err(service_error)?;
+    if direct.as_deref() == Some(id) {
+        return Ok(true);
+    }
+    if lifecycle::stack_active() {
+        let stack = crate::mode::controller::stack_views(state, &AppType::Codex)
+            .map_err(|_| "stack_read_failed")?;
+        return Ok(stack.members.iter().any(|member| member.provider_id == id));
+    }
+    Ok(false)
+}
+
 // Persist an edited row. A row in use whose route need no longer matches the
 // mode is stored first, then switched into the right mode.
 fn persist(host: &Host, previous: Option<&Provider>, edited: Provider) -> Result<bool> {
@@ -185,9 +242,19 @@ pub(super) fn handle(host: &Host, method: &str, params: &Value) -> Result<Value>
             form::summary(state, &stored, &edited)
         }
         "gui/provider/save" => {
-            let _guard = lifecycle::mutation()?;
-            let recovery = auto_capture::before_write_or_credential_recovery(state)?;
             let id = params["id"].as_str().ok_or("invalid_params")?;
+            valid_id(id)?;
+            // The caller cannot reconnect now: store the row only if that changes nothing in use.
+            let inactive_only = params["inactiveOnly"].as_bool() == Some(true);
+            let gate = WriteGate::enter(state)?;
+            if (inactive_only || gate.beside()) && in_use(state, id)? {
+                return Err(if inactive_only {
+                    "runtime_busy"
+                } else {
+                    "route_requests_active"
+                });
+            }
+            let recovery = gate.recovery(state)?;
             let (previous, edited) = edit_base(host, params)?;
             let edited = form::edit(edited, params)?;
             if let Some(account) = edited
@@ -219,6 +286,13 @@ pub(super) fn handle(host: &Host, method: &str, params: &Value) -> Result<Value>
                     on_conflict,
                 )?;
                 if !plan.edits.is_empty() {
+                    if inactive_only || gate.beside() {
+                        return Err(if inactive_only {
+                            "runtime_busy"
+                        } else {
+                            "route_requests_active"
+                        });
+                    }
                     if recovery {
                         return Err("credential_recovery_confirmation_required");
                     }
@@ -250,8 +324,11 @@ pub(super) fn handle(host: &Host, method: &str, params: &Value) -> Result<Value>
             Ok(result)
         }
         "gui/provider/copy" => {
-            let _guard = lifecycle::mutation()?;
-            auto_capture::before_write(state)?;
+            // A copy is never in use, so it can be stored beside routed requests.
+            let gate = WriteGate::enter(state)?;
+            if !gate.beside() {
+                auto_capture::before_write(state)?;
+            }
             let (_, mut edited) = selected(host, params, true)?;
             let id = params["newId"].as_str().ok_or("invalid_params")?;
             let name = params["name"].as_str().ok_or("invalid_params")?;

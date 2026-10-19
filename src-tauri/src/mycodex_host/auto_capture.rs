@@ -29,9 +29,46 @@ pub(super) fn read(state: &AppState) -> Result<Outcome> {
     lifecycle::pause_if_external();
     let _guard = match lifecycle::mutation() {
         Ok(guard) => guard,
-        Err(error) => return Ok(Outcome::unavailable(error)),
+        Err(error) => {
+            // Streaming requests hold the route; while it is still ours there is
+            // nothing to capture, so report the provider in use without waiting.
+            let Ok(_beside) = lifecycle::beside_requests() else {
+                return Ok(Outcome::unavailable(error));
+            };
+            return Ok(match steady_route(state)? {
+                Some(current) => Outcome {
+                    current,
+                    state: "current",
+                    error: None,
+                },
+                None => Outcome::unavailable(error),
+            });
+        }
     };
     reconcile(state, "read")
+}
+
+/// The provider in use when the client is still attached to this host's own
+/// route, as `capture` finds it; `None` when only a capture could tell. The
+/// caller holds `lifecycle::beside_requests`.
+pub(super) fn steady_route(state: &AppState) -> Result<Option<String>> {
+    if !lifecycle::routing() {
+        return Ok(None);
+    }
+    let Ok(text) = live_config_text() else {
+        return Ok(None);
+    };
+    if !lifecycle::owns_live(&text) {
+        return Ok(None);
+    }
+    let current = ProviderService::current(state, AppType::Codex).map_err(service_error)?;
+    let Ok(provider) = gui_provider::stored(state, &current) else {
+        return Ok(None);
+    };
+    if !matches!(lifecycle::conversion(&provider), Ok(true)) && !lifecycle::stack_active() {
+        return Ok(None);
+    }
+    Ok(Some(current))
 }
 
 pub(super) fn before_write(state: &AppState) -> Result<()> {

@@ -784,7 +784,7 @@ fn streaming_switch(external: bool) {
             json!({"providerId":"native","expectedVersion":selected["version"],
             "expectedFingerprint":"unused","operationId":"blocked-apply"}),
         ),
-        ("gui/provider/save", edit),
+        ("gui/provider/save", edit.clone()),
         ("backend/shutdown", json!({})),
         ("backend/shutdown", json!({"forUpdate":true})),
         ("backend/shutdown", json!({"forUpdate":false})),
@@ -796,6 +796,35 @@ fn streaming_switch(external: bool) {
         );
         assert_eq!(p.live_text(), before);
     }
+    // Rows that are not in use are stored beside the streaming request, and the
+    // unchanged route reads as the provider in use instead of an unavailable capture.
+    assert!(p.ok("status", json!({}))["capabilities"]
+        .as_array()
+        .unwrap()
+        .contains(&json!("inactiveSaveWhileBusy")));
+    let listed = p.ok("gui/provider/list", json!({}));
+    assert_eq!(listed["liveState"], "current");
+    assert_eq!(listed["currentProviderId"], "chat");
+    assert!(listed["syncError"].is_null());
+    let mut renamed = direct("native");
+    renamed["name"] = json!("Native renamed");
+    renamed["expectedVersion"] = selected["version"].clone();
+    assert_eq!(p.save(renamed)["name"], "Native renamed");
+    p.save(direct("added"));
+    let copied = p.ok(
+        "gui/provider/copy",
+        json!({"providerId":"added","expectedVersion":p.ok("gui/provider/get", json!({"providerId":"added"}))["version"],
+            "newId":"added-copy","name":"Added copy"}),
+    );
+    assert_eq!(copied["id"], "added-copy");
+    // The caller that cannot reconnect is refused for the provider in use.
+    let mut in_use = edit.clone();
+    in_use["inactiveOnly"] = json!(true);
+    assert_eq!(
+        p.call("gui/provider/save", in_use)["error"]["message"],
+        "runtime_busy"
+    );
+    assert_eq!(p.live_text(), before);
     let external_config = "model='external'\nmodel_provider='external'\n[model_providers.external]\nname='External'\nbase_url='https://external.example.invalid/v1'\nrequires_openai_auth=true\n";
     let external_auth = r#"{"OPENAI_API_KEY":"synthetic-secret-external"}"#;
     if external {
@@ -825,7 +854,7 @@ fn streaming_switch(external: bool) {
     if external {
         let state = p.ok("gui/provider/list", json!({}));
         assert_eq!(state["liveState"], "current");
-        assert_eq!(state["providers"].as_array().unwrap().len(), 3);
+        assert_eq!(state["providers"].as_array().unwrap().len(), 5);
         assert_eq!(state["route"]["takeover"], false);
         assert_eq!(p.live_text(), external_config);
         assert_eq!(

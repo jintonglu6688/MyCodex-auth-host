@@ -26,7 +26,7 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc, LazyLock, OnceLock,
 };
-use tokio::sync::{OwnedRwLockWriteGuard, RwLock};
+use tokio::sync::{OwnedRwLockReadGuard, OwnedRwLockWriteGuard, RwLock};
 
 // ponytail: one gate per target process; split by app only if this host ever
 // manages more than Codex. Read guards live through the complete HTTP body.
@@ -100,6 +100,35 @@ pub(super) fn mutation() -> Result<OwnedRwLockWriteGuard<()>> {
         .clone()
         .try_write_owned()
         .map_err(|_| "route_requests_active")
+}
+
+// Serializes the store-only writes that run beside routed requests.
+static BESIDE_REQUESTS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Held by work that changes neither the route nor the client files: it runs
+/// while routed requests stream, but never during a `mutation`.
+pub(super) struct BesideRequests {
+    _store: std::sync::MutexGuard<'static, ()>,
+    _requests: OwnedRwLockReadGuard<()>,
+}
+
+pub(super) fn beside_requests() -> Result<BesideRequests> {
+    let requests = REQUESTS
+        .clone()
+        .try_read_owned()
+        .map_err(|_| "route_requests_active")?;
+    let store = BESIDE_REQUESTS
+        .lock()
+        .map_err(|_| "route_requests_active")?;
+    Ok(BesideRequests {
+        _store: store,
+        _requests: requests,
+    })
+}
+
+/// Routed requests are being admitted for the attached client.
+pub(super) fn routing() -> bool {
+    ROUTING.load(Ordering::Acquire)
 }
 
 pub(crate) async fn admit(mut request: Request, next: Next) -> Response {
