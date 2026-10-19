@@ -93,11 +93,19 @@ pub(super) fn presets() -> Result<Value> {
                 advanced[gui] = serde_json::to_value(value).map_err(|_| "invalid_presets")?;
             }
         }
+        let base_url = provider
+            .and_then(|p| p.get("base_url"))
+            .and_then(toml::Value::as_str)
+            .unwrap_or("");
+        let anthropic_base_url = preset["name"]
+            .as_str()
+            .and_then(|name| export["anthropicBaseUrls"][name].as_str());
         result.push(json!({
             "id": if chatgpt {"chatgpt".to_string()} else {format!("cc-switch-{index}")},
             "name": if chatgpt {json!("ChatGPT")} else {preset["name"].clone()},
             "kind":kind,
-            "baseUrl":provider.and_then(|p|p.get("base_url")).and_then(toml::Value::as_str).unwrap_or(""),
+            "baseUrl":base_url,
+            "protocolBaseUrls":protocol_base_urls(kind, base_url, anthropic_base_url),
             "model":config.get("model").and_then(toml::Value::as_str).unwrap_or(""),
             "models":preset.get("modelCatalog").cloned().unwrap_or(json!([])),
             "advanced":advanced,"available":!unsupported,
@@ -106,6 +114,30 @@ pub(super) fn presets() -> Result<Value> {
         }));
     }
     Ok(json!({"presets":result}))
+}
+
+/// Base URL of one preset per selectable upstream format. OpenAI-compatible
+/// formats share the preset's endpoint; the Anthropic endpoint comes from the
+/// upstream Claude preset of the same provider, so a format change can move the
+/// form to the provider's matching endpoint.
+fn protocol_base_urls(kind: &str, base_url: &str, anthropic_base_url: Option<&str>) -> Value {
+    let mut urls = serde_json::Map::new();
+    match kind {
+        "responses" | "chat_completions" => {
+            if !base_url.is_empty() {
+                urls.insert("responses".into(), json!(base_url));
+                urls.insert("chat_completions".into(), json!(base_url));
+            }
+            if let Some(url) = anthropic_base_url.filter(|url| !url.is_empty()) {
+                urls.insert("anthropic".into(), json!(url));
+            }
+        }
+        "anthropic" if !base_url.is_empty() => {
+            urls.insert("anthropic".into(), json!(base_url));
+        }
+        _ => {}
+    }
+    Value::Object(urls)
 }
 
 const MODEL_ALIASES: &[(&str, &str)] = &[
@@ -468,13 +500,36 @@ mod tests {
                 ))
             )
         );
+        assert_eq!(
+            export["claudeSourceSha256"],
+            format!(
+                "{:x}",
+                Sha256::digest(include_bytes!(
+                    "../../../src/config/claudeProviderPresets.ts"
+                ))
+            )
+        );
         let result = presets().unwrap();
         let items = result["presets"].as_array().unwrap();
         assert!(items.len() > 10);
         assert!(items
             .iter()
             .any(|p| p["id"] == "chatgpt" && p["kind"] == "chatgpt"));
-        assert!(items.iter().any(|p| p["name"] == "DeepSeek"));
+        let deepseek = items.iter().find(|p| p["name"] == "DeepSeek").unwrap();
+        assert_eq!(
+            deepseek["protocolBaseUrls"],
+            json!({
+                "responses":"https://api.deepseek.com",
+                "chat_completions":"https://api.deepseek.com",
+                "anthropic":"https://api.deepseek.com/anthropic",
+            })
+        );
+        // A Claude preset that converts formats is not an Anthropic endpoint.
+        let copilot = items
+            .iter()
+            .find(|p| p["name"] == "GitHub Copilot")
+            .unwrap();
+        assert!(copilot["protocolBaseUrls"].get("anthropic").is_none());
         assert!(items
             .iter()
             .any(|p| p["id"] == "custom" && p["allowsProtocolSelection"] == true));
@@ -490,6 +545,30 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn protocol_base_urls_cover_only_known_endpoints() {
+        assert_eq!(
+            protocol_base_urls(
+                "anthropic",
+                "https://a.test/anthropic",
+                Some("https://b.test")
+            ),
+            json!({"anthropic":"https://a.test/anthropic"})
+        );
+        assert_eq!(
+            protocol_base_urls("chat_completions", "", Some("https://a.test/anthropic")),
+            json!({"anthropic":"https://a.test/anthropic"})
+        );
+        assert_eq!(
+            protocol_base_urls("responses", "https://a.test/v1", None),
+            json!({"responses":"https://a.test/v1","chat_completions":"https://a.test/v1"})
+        );
+        assert_eq!(
+            protocol_base_urls("chatgpt", "", Some("https://a.test")),
+            json!({})
+        );
     }
 
     #[test]
