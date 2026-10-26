@@ -124,6 +124,7 @@ jobs:
         with:
           distribution: Ubuntu-24.04
           wsl-version: 2
+          additional-packages: python3
 
       - name: Cache Cargo registry and build
         uses: actions/cache@v5
@@ -202,3 +203,15 @@ jobs:
           if ($LASTEXITCODE -ne 0) {
             exit $LASTEXITCODE
           }
+
+      - name: Run Hermes live WAL reads inside WSL2
+        env:
+          CC_SWITCH_WSL_DISTRO: Ubuntu-24.04
+        shell: pwsh
+        run: |
+          $testName = "session_manager::providers::hermes::tests::wsl2_live_wal_readonly_reference"
+          $testList = & $env:CC_SWITCH_TEST_EXE --list --ignored
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          if ($testList -notcontains "${testName}: test") { throw "Hermes WSL test not discovered" }
+          & $env:CC_SWITCH_TEST_EXE $testName --ignored --exact --nocapture
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }

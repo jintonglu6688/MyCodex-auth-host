@@ -73,7 +73,9 @@ pub(super) fn summary(account: &GitHubAccount) -> Value {
 
 pub(super) fn auth_error(error: CodexOAuthError) -> &'static str {
     match error {
-        CodexOAuthError::IoError(ref message) if message == "browser_callback_unavailable" => {
+        CodexOAuthError::IoError(ref message)
+            if message.starts_with("Cannot open the browser login callback") =>
+        {
             "browser_callback_unavailable"
         }
         CodexOAuthError::AccessDenied => "login_denied",

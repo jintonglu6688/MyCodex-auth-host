@@ -60,6 +60,7 @@ import {
   MatrixColumnHighlight,
   MatrixSearch,
   NeutralBadge,
+  ompDiscoveryColumnNote,
   resolveBulkScope,
   showUndoToast,
 } from "@/components/mcp/AppMatrix";
@@ -468,16 +469,24 @@ const UnifiedSkillsPanel: React.FC<UnifiedSkillsPanelProps> = ({
               void (async () => {
                 if (!beginWrite()) return;
                 try {
-                  await writeMany(succeeded, app, !enabled);
-                  toast.success(t("appMatrix.toast.undone"), {
-                    closeButton: true,
-                  });
+                  const result = await writeMany(succeeded, app, !enabled);
+                  if (result.failed) {
+                    toast[result.succeeded.length ? "warning" : "error"](
+                      t("common.bulkToggleFailed", { count: result.failed }),
+                      { closeButton: true },
+                    );
+                  } else {
+                    toast.success(t("appMatrix.toast.undone"), {
+                      closeButton: true,
+                    });
+                  }
                 } finally {
                   endWrite();
                 }
               })();
             }
           : undefined,
+        failed ? (succeeded.length ? "warning" : "error") : "success",
       );
     } finally {
       endWrite();
@@ -1292,6 +1301,7 @@ const UnifiedSkillsPanel: React.FC<UnifiedSkillsPanelProps> = ({
                             }
                           : undefined
                       }
+                      {...ompDiscoveryColumnNote(app, t)}
                       extraAction={{
                         label:
                           statusFilter === appFilter

@@ -8,7 +8,7 @@ pub(super) struct Login {
     id: String,
     target: Option<String>,
     device: String,
-    browser: Option<crate::proxy::providers::codex_oauth_auth::BrowserLogin>,
+    url: String,
     method: String,
     user_code: String,
     expires: i64,
@@ -25,14 +25,14 @@ impl Login {
         json!({"loginId":self.id,"targetAccountId":self.target,"status":self.status,
             "userCode":if self.status=="pending" {&self.user_code} else {""},
             "method":self.method,
-            "verificationUri":if self.method == "browser" { self.browser.as_ref().map(|b| b.url.as_str()).unwrap_or("") } else { "https://auth.openai.com/codex/device" },
+            "verificationUri":if self.method == "browser" { &self.url } else { "https://auth.openai.com/codex/device" },
             "expiresAt":Utc.timestamp_millis_opt(self.expires).single().map(|t|t.to_rfc3339()),
             "error":self.error,"account":self.account})
     }
     fn finish(&mut self, status: &'static str, error: Option<&'static str>) {
         self.status = status;
         self.error = error;
-        self.browser = None;
+        self.url.clear();
         self.device.clear();
         self.user_code.clear();
     }
@@ -118,7 +118,7 @@ pub(super) fn handle(host: &Host, method: &str, params: &Value) -> Result<Value>
                 id: id.into(),
                 target: target.clone(),
                 device: String::new(),
-                browser: None,
+                url: String::new(),
                 method: method.into(),
                 user_code: String::new(),
                 expires: now,
@@ -139,10 +139,11 @@ pub(super) fn handle(host: &Host, method: &str, params: &Value) -> Result<Value>
                         .codex_oauth_manager
                         .start_browser_flow(login.target.as_deref()),
                 ) {
+                    // The native flow id doubles as the device code for poll and cancel.
                     Ok(flow) => {
-                        login.device = flow.id.clone();
-                        login.expires = flow.expires;
-                        login.browser = Some(flow);
+                        login.device = flow.device_code;
+                        login.url = flow.verification_uri;
+                        login.expires = now + flow.expires_in as i64 * 1000;
                         login.interval = 1000;
                         login.status = "pending";
                     }
@@ -187,25 +188,7 @@ pub(super) fn handle(host: &Host, method: &str, params: &Value) -> Result<Value>
                 login.finish("expired", Some("login_expired"));
             } else if Utc::now().timestamp_millis() >= login.next_poll {
                 login.next_poll = Utc::now().timestamp_millis() + login.interval;
-                let result = if let Some(browser) = login.browser.as_mut() {
-                    block_on(
-                        state
-                            .codex_oauth_manager
-                            .poll_browser_login(browser, || async {
-                                state.proxy_service.lock_switch_for_app("codex").await
-                            }),
-                    )
-                    .map(|account| match account {
-                        Some(account) => {
-                            json!({"status":"authorized","account":accounts::summary(&account)})
-                        }
-                        None => json!({"status":"pending"}),
-                    })
-                    .map_err(accounts::auth_error)
-                } else {
-                    accounts::handle(state, "account/login/poll", &native)
-                };
-                match result {
+                match accounts::handle(state, "account/login/poll", &native) {
                     Ok(value) if value["status"] == "authorized" => {
                         login.account = Some(account_summary(host, &value["account"]));
                         login.finish("completed", None);

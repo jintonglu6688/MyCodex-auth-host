@@ -81,7 +81,7 @@ fn view(state: &AppState) -> Result<Value> {
         "members": members,
         "providers": providers,
         "notice": stack.notice,
-        "classicSubagents": settings::codex_stack_classic_subagents(),
+        "classicSubagents": settings::codex_stack_classic_tools(),
         "unifiedSessionHistory": settings::unify_codex_session_history(),
     }))
 }
@@ -209,11 +209,11 @@ fn set_settings(state: &AppState, params: &Value) -> Result<Value> {
     let _guard = lifecycle::mutation()?;
     auto_capture::before_write(state)?;
     let existing = settings::get_settings();
-    if existing.codex_stack_classic_subagents == classic {
+    if existing.codex_stack_classic_tools == classic {
         return with_applied(state, false);
     }
     let mut next = existing.clone();
-    next.codex_stack_classic_subagents = classic;
+    next.codex_stack_classic_tools = classic;
     settings::update_settings(next).map_err(service_error)?;
     if block_on(controller::resync_codex_stack_catalog(state)).is_err() {
         let _ = settings::update_settings(existing);
