@@ -240,6 +240,16 @@ Mac SSH 目标验收时“更新后台”失败，界面只显示通用失败。
   - 按 `rollout-*-<threadId>.jsonl[.zst]` 只在 `sessions/`、`archived_sessions/` 下查找。与历史迁移共用一把锁；写回前后各确认文件未变（变了返回 `session_changed`）。原文件备份到私有目录 `backups/codex-session-repair-v1/<时间>/`，保留最近 50 份。
 - 回归测试：`unified_session_history_resumes_relay_sessions_with_the_chatgpt_account`、`unified_session_history_changes_no_live_file_while_a_relay_is_in_use`、`unified_session_history_moves_official_sessions_both_ways_without_copying_them`、`session_repair_cleans_another_providers_turns_before_the_chatgpt_account_resumes_them`，以及 `mycodex_host::session_repair`、`mycodex_host::session_ledger` 的单元测试。
 
+## 后续：合并上游 v4.0.20（0.3.11）
+
+- 分支 `merge/v4.0.20`：合并 v4.0.20（`85ad4969`），再挑入其后的 `de0a235a`（转换时按 `model_provider` 选中的表取 `base_url`）。身份和打包脚本的 `upstreamRevision` 改为 `85ad4969b3399500baaea9d46b1e08f87aba80e1`，`hostVersion` 0.3.11；前端把 `790ed800` 的 0.3.x 安装识别为可更新。
+- 冲突 3 个：`lib.rs`（两边模块都留）；`mode/controller.rs`（宿主的 `detach` 与上游 `RouteSwitchResult` 都留，`detach` 经 `exit_locked(keep_mode)` 自动获得「脱离时保留 ChatGPT 登录」）；`codex_oauth_auth.rs` 以上游为准，重打导入已有登录、两个错误码、`CodexAccountData` 比较、令牌时间只按观察值更新、凭据库直接 rename、`load_from_disk_sync` 可见性。
+- 浏览器登录改用上游实现（`codex_oauth_auth/browser.rs`），删除自有 `codex_oauth_browser.rs`。宿主用 `start_browser_flow` 开始，返回的 `device_code`（`browser:<uuid>`）走原有的 `account/login/poll`、`cancel`。差异：回调固定 `localhost:1455`，被占用时报 `browser_callback_unavailable`，不再退到 1457；回调页文案是上游的「Return to CC Switch」。浏览器登录仍只在 Windows 目标提供。
+- 聚合设置：上游把经典子 agent 工具开关换成默认开的新键 `codex_stack_classic_tools`，旧键 `codexStackClassicSubagents` 不再读；宿主接口字段 `classicSubagents` 不变，升级后一律按开。上游新增的聚合子 agent 模型、Auto Review 模型没有接入宿主接口。
+- 预设重新导出（98 → 135）；上游新增 `hidden` 字段，宿主列表跳过隐藏预设（目前是 Mistral AI），预设 id 仍按导出序号。新增分类 `cloud_provider`、`local` 不影响宿主（列表不输出分类）。
+- 设备级目录：上游新增的 `DeviceStore::for_device()` 调用（聚合目录等）由已有重定向覆盖；`settings.json` 的原子写入和损坏备份走被重定向的 `settings_path()`。
+- 上游 `9d4aff88`（`cc-switch-official` 会话迁回 `openai`）只在桌面程序启动时运行，宿主未接入：MyCodex 的官方账号一直直连，不产生这类会话。
+
 ## 主要风险
 
 | 风险 | 应对 |

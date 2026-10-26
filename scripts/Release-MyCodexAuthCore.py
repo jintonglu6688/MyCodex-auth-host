@@ -16,7 +16,7 @@ TARGETS = (
     "aarch64-unknown-linux-gnu",
     "aarch64-apple-darwin",
 )
-UPSTREAM = "790ed8009df809bedaf6c31b5ced05da46bb1f1f"
+UPSTREAM = "85ad4969b3399500baaea9d46b1e08f87aba80e1"
 
 
 def require(condition, message):
@@ -48,7 +48,7 @@ def validate(manifest, target, revision):
             and manifest.get("sourceRevision") == revision, "Unexpected source revision.")
     require(manifest.get("sourceDirty") is False, "Cloud releases require clean source.")
     require(manifest.get("schemaVersion") == 1 and manifest.get("protocolVersion") == 3
-            and manifest.get("hostVersion") == "0.3.10"
+            and manifest.get("hostVersion") == "0.3.11"
             and manifest.get("upstreamRevision") == UPSTREAM, "Incompatible core identity.")
     executable = NAME + (".exe" if "windows" in target else "")
     require(manifest.get("executable") == executable, "Unexpected executable name.")

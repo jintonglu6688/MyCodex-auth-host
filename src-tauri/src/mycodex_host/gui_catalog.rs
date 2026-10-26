@@ -56,6 +56,10 @@ pub(super) fn presets() -> Result<Value> {
         .iter()
         .enumerate()
     {
+        // Upstream keeps hidden presets in its data but not in its list; ids stay index-based.
+        if preset["hidden"] == true {
+            continue;
+        }
         let config: toml::Value = preset["config"]
             .as_str()
             .ok_or("invalid_presets")?
@@ -534,6 +538,12 @@ mod tests {
             .iter()
             .any(|p| p["id"] == "custom" && p["allowsProtocolSelection"] == true));
         assert!(items.iter().any(|p| p["available"] == false));
+        assert!(export["presets"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|p| p["hidden"] == true)
+            .all(|hidden| items.iter().all(|p| p["name"] != hidden["name"])));
         for item in items {
             validate_models(item["models"].as_array().unwrap()).unwrap();
             if item["available"] == true {

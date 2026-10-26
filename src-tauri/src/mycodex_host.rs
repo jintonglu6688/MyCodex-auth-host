@@ -32,7 +32,7 @@ mod stack;
 
 type Result<T> = std::result::Result<T, &'static str>;
 const MAX_REQUEST: usize = 1_048_576;
-const UPSTREAM: &str = "790ed8009df809bedaf6c31b5ced05da46bb1f1f";
+const UPSTREAM: &str = "85ad4969b3399500baaea9d46b1e08f87aba80e1";
 
 pub(crate) struct RuntimePaths {
     pub data_dir: PathBuf,
