@@ -18,7 +18,6 @@ pub(super) fn handle(host: &Host, method: &str, params: &Value) -> Result<Value>
         "gui/stack/enter" => enter(&host.state, params),
         "gui/stack/exit" => exit(&host.state),
         "gui/stack/member/set" => set_member(&host.state, params),
-        "gui/stack/default/set" => set_default(&host.state, params),
         "gui/stack/catalog/adopt" => adopt_catalog(&host.state),
         "gui/stack/settings/set" => set_settings(&host.state, params),
         _ => Err("method_not_supported"),
@@ -179,17 +178,6 @@ fn set_member(state: &AppState, params: &Value) -> Result<Value> {
     write_member(state, id, enabled)?;
     lifecycle::sync_routing(state);
     with_applied(state, lifecycle::stack_active())
-}
-
-fn set_default(state: &AppState, params: &Value) -> Result<Value> {
-    let _guard = lifecycle::mutation()?;
-    auto_capture::before_write(state)?;
-    if !lifecycle::stack_active() {
-        return Err("stack_not_active");
-    }
-    let row = provider(state, params)?;
-    lifecycle::activate(state, &row)?;
-    with_applied(state, true)
 }
 
 /// The default row points at its own catalog file, which hides the aggregated

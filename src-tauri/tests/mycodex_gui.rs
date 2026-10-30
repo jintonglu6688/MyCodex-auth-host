@@ -2238,7 +2238,8 @@ fn aggregation_publishes_listed_providers_and_returns_to_the_default() {
     let mut doc: toml_edit::DocumentMut = gui.config().parse().unwrap();
     doc["model"] = toml_edit::value("ccs-relay-chat/model-a");
     std::fs::write(&path, doc.to_string()).unwrap();
-    let moved = gui.ok("gui/stack/default/set", json!({"providerId":"relay-chat"}));
+    switch_gui(&gui, "relay-chat", "to-chat");
+    let moved = gui.ok("gui/stack/get", json!({}));
     assert_eq!(moved["defaultProviderId"], "relay-chat", "{moved}");
     assert!(catalog_text(&gui).contains("ccs-relay-a/model-a"));
 
@@ -2379,7 +2380,8 @@ fn exit_points_codex_to_the_default_directly_and_the_next_start_routes_again() {
         json!({"defaultProviderId":"relay-a","memberIds":["relay-b"]}),
     );
     // The default changes after entering; the direct file must follow it.
-    let view = gui.ok("gui/stack/default/set", json!({"providerId":"relay-b"}));
+    switch_gui(&gui, "relay-b", "to-b");
+    let view = gui.ok("gui/stack/get", json!({}));
     let chosen = view["members"]
         .as_array()
         .unwrap()
