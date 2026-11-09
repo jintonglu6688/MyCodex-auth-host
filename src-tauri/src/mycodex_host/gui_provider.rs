@@ -56,11 +56,15 @@ pub(super) fn snapshot(state: &AppState, provider: &Provider) -> Result<Provider
 }
 
 pub(super) fn version(stored: &Provider, edited: &Provider) -> String {
-    // List position is not content: reordering must not invalidate open edits or plans.
+    // List position and usage-query settings are not applied configuration:
+    // changing them must not invalidate open edits or plans.
     let unordered = |provider: &Provider| {
         let mut value = json!(provider);
         if let Some(fields) = value.as_object_mut() {
             fields.remove("sortIndex");
+        }
+        if let Some(meta) = value.get_mut("meta").and_then(Value::as_object_mut) {
+            meta.remove("usage_script");
         }
         value
     };

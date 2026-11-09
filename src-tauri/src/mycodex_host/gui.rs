@@ -95,13 +95,13 @@ pub(super) fn edit_base(host: &Host, params: &Value) -> Result<(Option<Provider>
 /// The lock a provider write holds. Without routed requests it is the usual
 /// `mutation`; while they stream, only rows that are not in use can be stored,
 /// and only when the client is still on this host's unchanged route.
-enum WriteGate {
+pub(super) enum WriteGate {
     Exclusive(#[allow(dead_code)] tokio::sync::OwnedRwLockWriteGuard<()>),
     Beside(#[allow(dead_code)] lifecycle::BesideRequests),
 }
 
 impl WriteGate {
-    fn enter(state: &crate::AppState) -> Result<Self> {
+    pub(super) fn enter(state: &crate::AppState) -> Result<Self> {
         match lifecycle::mutation() {
             Ok(guard) => Ok(Self::Exclusive(guard)),
             Err(error) => {
@@ -112,7 +112,7 @@ impl WriteGate {
         }
     }
 
-    fn beside(&self) -> bool {
+    pub(super) fn beside(&self) -> bool {
         matches!(self, Self::Beside(_))
     }
 
@@ -205,6 +205,7 @@ pub(super) fn handle(host: &Host, method: &str, params: &Value) -> Result<Value>
         "gui/preset/list" => gui_catalog::presets(),
         "gui/model/fetch" => gui_catalog::fetch_models(state, params),
         method if method.starts_with("gui/mcp/") => super::gui_mcp::handle(host, method, params),
+        method if method.starts_with("gui/usage/") => super::usage::handle(host, method, params),
         method if method.starts_with("gui/sessionHistory/") => {
             super::session_history::handle(host, method, params)
         }

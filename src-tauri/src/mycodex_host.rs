@@ -29,6 +29,7 @@ mod session_ledger;
 mod session_repair;
 mod shadowed_settings;
 mod stack;
+mod usage;
 
 type Result<T> = std::result::Result<T, &'static str>;
 const MAX_REQUEST: usize = 1_048_576;
@@ -196,6 +197,7 @@ fn handle(host: &Host, request: &Request) -> Result<Value> {
         "gui/provider/save"
             | "gui/provider/copy"
             | "gui/provider/reorder"
+            | "gui/usage/save"
             | "gui/provider/delete"
             | "gui/provider/apply"
             | "gui/provider/preflight"
@@ -230,6 +232,7 @@ fn handle(host: &Host, request: &Request) -> Result<Value> {
                 "aggregation",
                 "inactiveSaveWhileBusy",
                 "providerOrdering",
+                "providerUsage",
             ]);
             value["route"] = lifecycle::status(state)?;
             Ok(value)

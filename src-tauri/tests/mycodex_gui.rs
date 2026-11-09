@@ -28,6 +28,8 @@ impl Gui {
             .env("USERPROFILE", self.root.path().join("home"))
             .env("LOCALAPPDATA", self.root.path().join("home"))
             .env("MYCODEX_SYNTHETIC_CAPTURE_KEY", "synthetic-secret-env")
+            // Usage tests serve a local endpoint; a machine proxy must not intercept it.
+            .env("NO_PROXY", "127.0.0.1,localhost")
             .env_remove("MYCODEX_SYNTHETIC_MISSING_KEY")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -1140,6 +1142,132 @@ fn gui_apply_receipts_presets_copy_delete_and_account_failure_contracts() {
         gui.call("gui/account/login/get", json!({"loginId":"offline-login"}))["error"]["message"],
         "login_not_found"
     );
+}
+
+/// One local HTTP exchange: returns the base URL and the raw request it received.
+fn usage_server(body: &'static str) -> (String, std::sync::mpsc::Receiver<String>) {
+    use std::io::Read;
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let base = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        if let Ok((mut stream, _)) = listener.accept() {
+            let mut request = Vec::new();
+            let mut buffer = [0u8; 4096];
+            while !request.windows(4).any(|w| w == b"\r\n\r\n") {
+                match stream.read(&mut buffer) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => request.extend_from_slice(&buffer[..n]),
+                }
+            }
+            let _ = tx.send(String::from_utf8_lossy(&request).into_owned());
+            let _ = stream.write_all(
+                format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                )
+                .as_bytes(),
+            );
+        }
+    });
+    (base, rx)
+}
+
+#[test]
+fn gui_usage_settings_query_a_local_endpoint_and_never_return_secrets() {
+    let mut gui = Gui::new();
+    gui.start();
+    assert!(gui.ok("status", json!({}))["capabilities"]
+        .as_array()
+        .unwrap()
+        .contains(&json!("providerUsage")));
+    gui.ok("gui/provider/save", save("one"));
+    let initial = gui.ok("gui/usage/get", json!({"providerId":"one"}));
+    assert_eq!(initial["config"], Value::Null);
+    assert_eq!(initial["detected"], Value::Null);
+    assert_eq!(initial["providerName"], "one");
+    assert_eq!(
+        gui.call("gui/usage/query", json!({"providerId":"one"}))["error"]["message"],
+        "usage_not_configured"
+    );
+    let version = gui.ok("gui/provider/get", json!({"providerId":"one"}))["version"].clone();
+    let (base, requests) = usage_server(r#"{"balance":12.5,"is_active":true}"#);
+    let saved = gui.ok(
+        "gui/usage/save",
+        json!({"providerId":"one","enabled":true,"templateType":"general","baseUrl":base,
+            "apiKey":"synthetic-secret-usage","timeout":5,"autoQueryInterval":0}),
+    );
+    assert_eq!(saved["config"]["templateType"], "general");
+    assert_eq!(saved["config"]["hasApiKey"], true);
+    assert_eq!(saved["config"]["baseUrl"], json!(base));
+    assert_eq!(saved["config"]["autoQueryInterval"], 0);
+    assert_eq!(
+        saved["config"]["code"],
+        Value::Null,
+        "built-in scripts stay in the backend"
+    );
+    assert_eq!(
+        gui.ok("gui/provider/get", json!({"providerId":"one"}))["version"],
+        version,
+        "usage settings must not invalidate an open provider edit"
+    );
+    let result = gui.ok("gui/usage/query", json!({"providerId":"one"}));
+    assert_eq!(result["success"], true, "{result}");
+    assert_eq!(result["data"][0]["remaining"], 12.5);
+    assert_eq!(result["data"][0]["unit"], "USD");
+    let request = requests
+        .recv_timeout(std::time::Duration::from_secs(10))
+        .unwrap();
+    assert!(request.starts_with("GET /user/balance "), "{request}");
+    assert!(request.contains("Bearer synthetic-secret-usage"));
+
+    // An omitted secret is kept; a disabled query is refused.
+    let kept = gui.ok(
+        "gui/usage/save",
+        json!({"providerId":"one","enabled":false,"templateType":"newapi","baseUrl":base,"userId":"42"}),
+    );
+    assert_eq!(kept["config"]["hasApiKey"], true);
+    assert_eq!(kept["config"]["userId"], "42");
+    assert_eq!(
+        gui.call("gui/usage/query", json!({"providerId":"one"}))["error"]["message"],
+        "usage_not_configured"
+    );
+    for (params, error) in [
+        (
+            json!({"providerId":"one","enabled":true,"templateType":"github_copilot"}),
+            "invalid_params",
+        ),
+        (
+            json!({"providerId":"one","enabled":true,"templateType":"custom"}),
+            "invalid_params",
+        ),
+        (
+            json!({"providerId":"one","enabled":true,"templateType":"general","timeout":0}),
+            "invalid_params",
+        ),
+        (
+            json!({"providerId":"one","enabled":true,"templateType":"general","baseUrl":"https://user:pw@example.invalid"}),
+            "invalid_base_url",
+        ),
+        (
+            json!({"providerId":"missing","enabled":true,"templateType":"general"}),
+            "provider_not_found",
+        ),
+    ] {
+        assert_eq!(
+            gui.call("gui/usage/save", params)["error"]["message"],
+            error
+        );
+    }
+    let custom = gui.ok(
+        "gui/usage/save",
+        json!({"providerId":"one","enabled":true,"templateType":"custom","code":"({request:{url:''},extractor:function(r){return {remaining:1};}})","clearApiKey":true}),
+    );
+    assert_eq!(custom["config"]["hasApiKey"], false);
+    assert!(custom["config"]["code"]
+        .as_str()
+        .unwrap()
+        .contains("extractor"));
 }
 
 #[test]

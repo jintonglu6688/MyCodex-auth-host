@@ -24,6 +24,11 @@ enum BalanceProvider {
     NovitaAI,
 }
 
+/// MyCodex: whether `get_balance` knows this address, without exposing the provider enum.
+pub(crate) fn is_supported(base_url: &str) -> bool {
+    detect_provider(base_url).is_some()
+}
+
 fn detect_provider(base_url: &str) -> Option<BalanceProvider> {
     let url = base_url.to_lowercase();
     if url.contains("api.deepseek.com") {
