@@ -195,6 +195,7 @@ fn handle(host: &Host, request: &Request) -> Result<Value> {
         request.method.as_str(),
         "gui/provider/save"
             | "gui/provider/copy"
+            | "gui/provider/reorder"
             | "gui/provider/delete"
             | "gui/provider/apply"
             | "gui/provider/preflight"
@@ -228,6 +229,7 @@ fn handle(host: &Host, request: &Request) -> Result<Value> {
                 "sessionHistoryRepair",
                 "aggregation",
                 "inactiveSaveWhileBusy",
+                "providerOrdering",
             ]);
             value["route"] = lifecycle::status(state)?;
             Ok(value)

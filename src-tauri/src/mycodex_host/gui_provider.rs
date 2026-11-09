@@ -56,7 +56,15 @@ pub(super) fn snapshot(state: &AppState, provider: &Provider) -> Result<Provider
 }
 
 pub(super) fn version(stored: &Provider, edited: &Provider) -> String {
-    hash(&json!({"stored":stored,"edited":edited}))
+    // List position is not content: reordering must not invalidate open edits or plans.
+    let unordered = |provider: &Provider| {
+        let mut value = json!(provider);
+        if let Some(fields) = value.as_object_mut() {
+            fields.remove("sortIndex");
+        }
+        value
+    };
+    hash(&json!({"stored":unordered(stored),"edited":unordered(edited)}))
 }
 
 // Only retire our own catalog projection. External catalog files remain user-owned.

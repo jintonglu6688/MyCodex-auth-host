@@ -357,6 +357,47 @@ pub(super) fn handle(host: &Host, method: &str, params: &Value) -> Result<Value>
             let stored = form::stored(state, id)?;
             form::summary(state, &stored, &stored)
         }
+        "gui/provider/reorder" => {
+            // Only row positions change, so this can be stored beside routed requests.
+            let gate = WriteGate::enter(state)?;
+            if !gate.beside() {
+                auto_capture::before_write(state)?;
+            }
+            let ids = params["providerIds"]
+                .as_array()
+                .ok_or("invalid_params")?
+                .iter()
+                .map(|id| id.as_str().ok_or("invalid_params"))
+                .collect::<Result<Vec<_>>>()?;
+            for id in &ids {
+                valid_id(id)?;
+            }
+            // The request must name every saved row exactly once; anything else is a stale list.
+            let mut requested = ids.clone();
+            requested.sort_unstable();
+            let mut saved = ProviderService::list(state, AppType::Codex)
+                .map_err(service_error)?
+                .keys()
+                .cloned()
+                .collect::<Vec<_>>();
+            saved.sort_unstable();
+            if requested.windows(2).any(|pair| pair[0] == pair[1])
+                || requested != saved.iter().map(String::as_str).collect::<Vec<_>>()
+            {
+                return Err("version_conflict");
+            }
+            let updates = ids
+                .iter()
+                .enumerate()
+                .map(|(sort_index, id)| crate::services::ProviderSortUpdate {
+                    id: (*id).into(),
+                    sort_index,
+                })
+                .collect();
+            ProviderService::update_sort_order(state, AppType::Codex, updates)
+                .map_err(|_| "save_outcome_unknown")?;
+            Ok(json!({"providerIds":ids}))
+        }
         "gui/provider/delete" => {
             let _guard = lifecycle::mutation()?;
             auto_capture::before_write(state)?;

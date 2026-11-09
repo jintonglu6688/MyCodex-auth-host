@@ -1143,6 +1143,82 @@ fn gui_apply_receipts_presets_copy_delete_and_account_failure_contracts() {
 }
 
 #[test]
+fn gui_reorder_persists_full_order_without_changing_versions_and_refuses_stale_lists() {
+    let mut gui = Gui::new();
+    gui.start();
+    assert!(gui.ok("status", json!({}))["capabilities"]
+        .as_array()
+        .unwrap()
+        .contains(&json!("providerOrdering")));
+    for id in ["one", "two", "three"] {
+        gui.ok("gui/provider/save", save(id));
+    }
+    let rows = |gui: &Gui| {
+        gui.ok("gui/provider/list", json!({}))["providers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| {
+                (
+                    row["id"].as_str().unwrap().to_string(),
+                    row["version"].clone(),
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+    let before = rows(&gui);
+    // Unordered rows list by id until the first reorder assigns every position.
+    assert_eq!(
+        before.iter().map(|(id, _)| id.as_str()).collect::<Vec<_>>(),
+        ["one", "three", "two"]
+    );
+    let order = json!(["three", "one", "two"]);
+    assert_eq!(
+        gui.ok("gui/provider/reorder", json!({"providerIds":order}))["providerIds"],
+        order
+    );
+    let after = rows(&gui);
+    assert_eq!(
+        after.iter().map(|(id, _)| id.as_str()).collect::<Vec<_>>(),
+        ["three", "one", "two"]
+    );
+    for (id, version) in &before {
+        assert_eq!(
+            &after.iter().find(|(other, _)| other == id).unwrap().1,
+            version,
+            "a position change must not invalidate an open edit"
+        );
+    }
+    let one = gui.ok("gui/provider/get", json!({"providerId":"one"}));
+    gui.ok(
+        "gui/provider/copy",
+        json!({"providerId":"one","expectedVersion":one["version"],"newId":"four","name":"Four"}),
+    );
+    assert_eq!(rows(&gui).last().unwrap().0, "four");
+    for stale in [
+        json!(["three", "one", "two"]),
+        json!(["three", "one", "two", "two"]),
+        json!(["three", "one", "two", "missing"]),
+    ] {
+        assert_eq!(
+            gui.call("gui/provider/reorder", json!({"providerIds":stale}))["error"]["message"],
+            "version_conflict"
+        );
+    }
+    assert_eq!(
+        gui.call("gui/provider/reorder", json!({"providerIds":["../bad"]}))["error"]["message"],
+        "invalid_params"
+    );
+    assert_eq!(
+        rows(&gui)
+            .iter()
+            .map(|(id, _)| id.as_str())
+            .collect::<Vec<_>>(),
+        ["three", "one", "two", "four"]
+    );
+}
+
+#[test]
 fn gui_routed_switches_capture_live_tools_before_backup_restore_and_restart() {
     let mut gui = Gui::new();
     gui.start();
