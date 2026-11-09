@@ -177,7 +177,8 @@ pub(super) fn summary(state: &AppState, stored: &Provider, edited: &Provider) ->
         "hasApiKey":!key.is_empty(),"accountId":account_id,
         "accountLabel":account.map(|a| a.login.as_str()),
         "needsReauthentication":account_id.is_some() && account.is_none_or(|a|a.reauth_required),
-        "models":masked(&json!(gui_catalog::read_models(edited)?)),"advanced":masked(&read_advanced(edited)?)}))
+        "models":masked(&json!(gui_catalog::read_models(edited)?)),"advanced":masked(&read_advanced(edited)?),
+        "usageEnabled":super::usage::enabled(stored)}))
 }
 
 fn masked_url(base: &str) -> String {

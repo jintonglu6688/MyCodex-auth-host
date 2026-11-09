@@ -135,6 +135,11 @@ fn script(provider: &Provider) -> Option<&UsageScript> {
         })
 }
 
+/// Whether the provider list should query this row's usage.
+pub(super) fn enabled(provider: &Provider) -> bool {
+    script(provider).is_some_and(|s| s.enabled)
+}
+
 fn present(value: &Option<String>) -> bool {
     value.as_deref().is_some_and(|v| !v.is_empty())
 }
@@ -160,10 +165,16 @@ fn view(provider: &Provider) -> Result<Value> {
             "timeout": s.timeout.unwrap_or(10),
             "autoQueryInterval": s.auto_query_interval.unwrap_or(5),
             "code": (s.template_type.as_deref() == Some("custom")).then(|| s.code.clone()),
+            "zhipuTeam": s.coding_plan_provider.as_deref() == Some("zhipu_team"),
+            "hasAccessKey": present(&s.access_key_id) && present(&s.secret_access_key),
+            "teamOrganizationId": s.team_organization_id,
+            "teamProjectId": s.team_project_id,
         })
     });
+    // The coding plan the address names decides which extra credentials apply.
+    let plan = coding_plan::detect_provider_id(&base);
     Ok(
-        json!({"providerId":provider.id,"providerName":provider.name,"config":config,"detected":detected}),
+        json!({"providerId":provider.id,"providerName":provider.name,"config":config,"detected":detected,"planProvider":plan}),
     )
 }
 
@@ -229,6 +240,11 @@ fn save(state: &AppState, params: &Value) -> Result<Value> {
     };
     let (provider_base, _) = provider.resolve_usage_credentials(&AppType::Codex);
     let kept = |pick: fn(&UsageScript) -> Option<String>| previous.as_ref().and_then(pick);
+    let plan = coding_plan::detect_provider_id(&provider_base);
+    // Zhipu's team plan shares the personal plan's address, so only the user can choose it.
+    let team = template == "token_plan"
+        && plan == Some("zhipu")
+        && params["zhipuTeam"].as_bool() == Some(true);
     let script = UsageScript {
         enabled: params["enabled"].as_bool().ok_or("invalid_params")?,
         language: "javascript".into(),
@@ -244,14 +260,33 @@ fn save(state: &AppState, params: &Value) -> Result<Value> {
         user_id: text("userId", 128)?,
         template_type: Some(template.into()),
         auto_query_interval: Some(number("autoQueryInterval", 5, 0..=1440)?),
-        coding_plan_provider: coding_plan::detect_provider_id(&provider_base)
-            .map(str::to_string)
-            .or_else(|| kept(|s| s.coding_plan_provider.clone())),
-        // shortcut: Volcengine AK/SK and Zhipu team IDs are not editable here; values saved by CC Switch are kept. Add fields when users ask.
-        access_key_id: kept(|s| s.access_key_id.clone()),
-        secret_access_key: kept(|s| s.secret_access_key.clone()),
-        team_organization_id: kept(|s| s.team_organization_id.clone()),
-        team_project_id: kept(|s| s.team_project_id.clone()),
+        coding_plan_provider: if team {
+            Some("zhipu_team".into())
+        } else {
+            plan.map(str::to_string)
+                .or_else(|| kept(|s| s.coding_plan_provider.clone()))
+        },
+        // Volcengine signs usage queries with the account AccessKey, not the inference key.
+        access_key_id: secret(
+            "accessKeyId",
+            "clearAccessKey",
+            kept(|s| s.access_key_id.clone()),
+        )?,
+        secret_access_key: secret(
+            "secretAccessKey",
+            "clearAccessKey",
+            kept(|s| s.secret_access_key.clone()),
+        )?,
+        team_organization_id: if team {
+            text("teamOrganizationId", 128)?
+        } else {
+            kept(|s| s.team_organization_id.clone())
+        },
+        team_project_id: if team {
+            text("teamProjectId", 128)?
+        } else {
+            kept(|s| s.team_project_id.clone())
+        },
     };
     provider
         .meta

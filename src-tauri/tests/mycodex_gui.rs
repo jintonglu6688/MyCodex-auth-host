@@ -1271,6 +1271,67 @@ fn gui_usage_settings_query_a_local_endpoint_and_never_return_secrets() {
 }
 
 #[test]
+fn gui_usage_plan_credentials_follow_the_provider_address() {
+    let mut gui = Gui::new();
+    gui.start();
+    let mut volc = save("volc");
+    volc["baseUrl"] = json!("https://ark.cn-beijing.volces.com/api/coding/v3");
+    gui.ok("gui/provider/save", volc);
+    let mut zhipu = save("zhipu");
+    zhipu["baseUrl"] = json!("https://open.bigmodel.cn/api/paas/v4");
+    gui.ok("gui/provider/save", zhipu);
+    assert_eq!(
+        gui.ok("gui/usage/get", json!({"providerId":"volc"}))["planProvider"],
+        "volcengine"
+    );
+    let saved = gui.ok(
+        "gui/usage/save",
+        json!({"providerId":"volc","enabled":true,"templateType":"token_plan",
+            "accessKeyId":"synthetic-secret-ak","secretAccessKey":"synthetic-secret-sk"}),
+    );
+    assert_eq!(saved["config"]["hasAccessKey"], true);
+    let row = |gui: &Gui, id: &str| {
+        gui.ok("gui/provider/list", json!({}))["providers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["id"] == id)
+            .unwrap()
+            .clone()
+    };
+    assert_eq!(row(&gui, "volc")["usageEnabled"], true);
+    assert_eq!(row(&gui, "zhipu")["usageEnabled"], false);
+    let cleared = gui.ok(
+        "gui/usage/save",
+        json!({"providerId":"volc","enabled":false,"templateType":"token_plan","clearAccessKey":true}),
+    );
+    assert_eq!(cleared["config"]["hasAccessKey"], false);
+    assert_eq!(row(&gui, "volc")["usageEnabled"], false);
+
+    let team = gui.ok(
+        "gui/usage/save",
+        json!({"providerId":"zhipu","enabled":true,"templateType":"token_plan","zhipuTeam":true,
+            "teamOrganizationId":"org-1","teamProjectId":""}),
+    );
+    assert_eq!(team["planProvider"], "zhipu");
+    assert_eq!(team["config"]["zhipuTeam"], true);
+    assert_eq!(team["config"]["teamOrganizationId"], "org-1");
+    // The team route is taken and reports the missing project ID without any network call.
+    let result = gui.ok("gui/usage/query", json!({"providerId":"zhipu"}));
+    assert_eq!(result["success"], false, "{result}");
+    assert!(
+        result["error"].as_str().unwrap().contains("project ID"),
+        "{result}"
+    );
+    // The team choice applies only to Zhipu addresses.
+    let personal = gui.ok(
+        "gui/usage/save",
+        json!({"providerId":"volc","enabled":true,"templateType":"token_plan","zhipuTeam":true}),
+    );
+    assert_eq!(personal["config"]["zhipuTeam"], false);
+}
+
+#[test]
 fn gui_reorder_persists_full_order_without_changing_versions_and_refuses_stale_lists() {
     let mut gui = Gui::new();
     gui.start();
