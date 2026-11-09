@@ -11,7 +11,7 @@ They contain no accounts, tokens, databases or `.codex` configuration.
 | `x86_64-pc-windows-msvc` | Windows Server 2022 runner | Windows x64; validate the intended Windows version before distribution |
 | `x86_64-unknown-linux-gnu` | Ubuntu 22.04 x64 | Compatible glibc and the shared libraries listed in `dependencies.txt` |
 | `aarch64-unknown-linux-gnu` | Ubuntu 22.04 ARM64 | Compatible glibc and the shared libraries listed in `dependencies.txt` |
-| `aarch64-apple-darwin` | macOS 14 Apple Silicon | Built with macOS 12 deployment target; CI execution covers macOS 14 only |
+| `aarch64-apple-darwin` | macOS 15 Apple Silicon | Built with macOS 12 deployment target; CI execution covers macOS 15 only |
 
 Intel Macs and Windows ARM64 are not built by this workflow.
 
