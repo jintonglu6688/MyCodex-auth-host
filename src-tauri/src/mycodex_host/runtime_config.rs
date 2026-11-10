@@ -29,6 +29,7 @@ fn normalize(text: &str) -> Result<String> {
 }
 
 pub(super) fn prepare() -> Result<Value> {
+    super::session_provider::recover_pending()?;
     let _guard = lifecycle::mutation()?;
     let path = codex_config::get_codex_config_path();
     let metadata = match fs::symlink_metadata(&path) {

@@ -27,6 +27,8 @@ mod session_choices;
 mod session_history;
 mod session_ledger;
 mod session_repair;
+mod session_provider;
+mod session_provider_metadata;
 mod shadowed_settings;
 mod stack;
 mod usage;
@@ -229,6 +231,7 @@ fn handle(host: &Host, request: &Request) -> Result<Value> {
                 "runtimeConfigPreparation",
                 "unifiedSessionHistory",
                 "sessionHistoryRepair",
+                "sessionProviderMigration",
                 "aggregation",
                 "inactiveSaveWhileBusy",
                 "providerOrdering",

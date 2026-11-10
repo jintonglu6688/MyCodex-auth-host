@@ -10,6 +10,8 @@ use serde_json::{json, Value};
 pub(super) fn handle(host: &Host, method: &str, params: &Value) -> Result<Value> {
     match method {
         "gui/sessionHistory/get" => status(host),
+        "gui/sessionHistory/provider" => super::session_provider::handle(params),
+        "gui/sessionHistory/providerRecovery" => super::session_provider::recover_before_start(),
         "gui/sessionHistory/preview" => {
             let (migrate, restore) = session_ledger::counts();
             Ok(json!({"toMigrate": migrate, "toRestore": restore}))

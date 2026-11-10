@@ -2869,3 +2869,6 @@ fn routed_compaction_is_admitted_only_with_the_route_credential() {
     assert!(!admitted.contains("route_not_supported"), "{admitted}");
     assert!(!admitted.starts_with("HTTP/1.1 401"), "{admitted}");
 }
+
+#[path = "support/mycodex_gui_provider_history.rs"]
+mod provider_history;

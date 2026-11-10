@@ -300,7 +300,7 @@ fn ledger_ids(codex_dir: &Path) -> BTreeSet<String> {
         .unwrap_or_default()
 }
 
-fn remember(codex_dir: &Path, ids: &BTreeSet<String>) -> Result<(), ()> {
+pub(super) fn remember(codex_dir: &Path, ids: &BTreeSet<String>) -> Result<(), ()> {
     let mut known = ledger_ids(codex_dir);
     if ids.is_subset(&known) {
         return Ok(());
